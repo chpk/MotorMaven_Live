@@ -44,9 +44,22 @@ transformers>=4.40.0
 # ============================================
 # SAM3 (Optional - for text-based segmentation)
 # ============================================
-# SAM3 uses native Meta package, install separately:
-#   pip install 'git+https://github.com/facebookresearch/sam3.git'
+# SAM3 uses native Meta package. Install as follows:
+#
+#   git clone https://github.com/facebookresearch/sam3.git
+#   cd sam3
+#   pip install einops decord pycocotools  # Required dependencies
+#   pip install -e .
+#
+# Then login to HuggingFace (SAM3 is a gated model):
+#   huggingface-cli login
+#
 # SAM3 understands natural language and semantic relations!
+
+# SAM3 dependencies (install these before sam3)
+einops>=0.8.0
+decord>=0.6.0
+pycocotools>=2.0.0
 
 # Model loading acceleration
 accelerate>=0.27.0
