@@ -102,25 +102,34 @@ class PreciseGeminiExtractor:
         "specific", "particular", "this", "that",
     }
     
-    SYSTEM_PROMPT = """You are an object identifier. Identify ONLY the objects the user mentions.
+    SYSTEM_PROMPT = """You are an object identifier for video segmentation. Extract ONLY the specific objects the user wants to see highlighted.
 
 OUTPUT FORMAT (JSON only):
 {"objects":[
-  {"description":"simple_name", "type":"generic|custom", "bbox":[x1,y1,x2,y2]}
+  {"description":"object_name", "type":"generic|custom", "bbox":[x1,y1,x2,y2]}
 ]}
 
 RULES:
-1. "description": Simple 1-2 word name (phone, wallet, motor, terminal)
+1. "description": Simple, clear object name that a segmentation model can understand
+   - Use common nouns: "phone", "laptop", "cup", "person", "hand"
+   - For specific items: "phone case", "coffee mug", "red wire"
+   - Keep it short (1-3 words max)
+
 2. "type": 
-   - "generic" for common objects (phone, wallet, cup, chair, person)
-   - "custom" for industrial/text/specific items (motor, terminal, label, specific text)
-3. "bbox": ONLY provide bbox for "custom" type objects. For "generic", use null.
+   - "generic" for common visible objects (phone, person, cup, chair, laptop, hand)
+   - "custom" for text/labels, industrial parts, or objects not visually obvious
 
-BBOX FORMAT (only for custom objects):
-- Normalized 0.0-1.0 coordinates: [left, top, right, bottom]
-- Be VERY precise for custom/industrial objects
+3. "bbox": ONLY provide for "custom" type. Use null for "generic".
+   - Format: [left, top, right, bottom] normalized 0.0-1.0
+   - Be precise for custom objects
 
-Return JSON only. No explanation."""
+IMPORTANT:
+- ONLY include objects the user explicitly asks about
+- If user says "highlight the phone", return: {"objects":[{"description":"phone","type":"generic","bbox":null}]}
+- If user says "show me what's in my hand", identify what they're holding
+- Don't add objects the user didn't mention
+
+Return JSON only."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -293,7 +302,8 @@ IMPORTANT:
                         detections.append(GeminiDetection(
                             description=desc,
                             bbox=valid_bbox,
-                            confidence=0.85 if obj_type == "custom" else 0.9
+                            confidence=0.85 if obj_type == "custom" else 0.9,
+                            object_type=obj_type  # Store the type!
                         ))
             
             # Fallback: extract description with regex if JSON parsing failed
@@ -470,13 +480,13 @@ class HybridSAMTracker:
         self.sam_model = None
         self.sam_processor = None
         
-        # Gemini extractor (only needed for SAM1/SAM2, not SAM3)
-        if api_key and not self.is_sam3:
+        # Gemini extractor - ALWAYS needed to understand what user wants to track
+        # SAM3 handles segmentation, but we need Gemini to extract object names from conversation
+        if api_key:
             print(f"[Tracker] Creating Gemini extractor with API key ({len(api_key)} chars)")
             self.gemini_extractor = PreciseGeminiExtractor(api_key)
-        elif self.is_sam3:
-            print("[Tracker] SAM3 mode - using direct text prompts (no Gemini extractor needed)")
-            self.gemini_extractor = None
+            if self.is_sam3:
+                print("[Tracker] SAM3 mode - Gemini extracts objects, SAM3 segments them")
         else:
             print("[Tracker] WARNING: No API key provided - Gemini extractor disabled!")
             self.gemini_extractor = None
@@ -1156,18 +1166,80 @@ class HybridSAMTracker:
         return annotated, detections
     
     def _process_frame_sam3(self, frame: np.ndarray, prompt: str) -> List[DetectedObject]:
-        """Process frame using SAM3 text-based segmentation."""
-        # Parse prompt - may contain multiple objects like "phone. wallet."
-        # SAM3 can handle each concept
-        objects = [obj.strip() for obj in prompt.replace(".", " ").split() if obj.strip()]
-        objects = list(set(objects))[:5]  # Limit to 5 unique objects
+        """
+        Process frame using SAM3 text-based segmentation.
         
+        SAM3 Strategy:
+        1. Get objects from Gemini detections (extracted from user speech)
+        2. For generic objects: use SAM3 text prompt directly
+        3. For custom/unseen objects: use SAM3 text prompt + Gemini bbox hint
+        """
         all_detections = []
-        for obj_name in objects:
-            if len(obj_name) < 2:
-                continue
-            detections = self.detect_with_sam3(frame, obj_name)
-            all_detections.extend(detections)
+        h, w = frame.shape[:2]
+        
+        # Get Gemini-extracted objects
+        with self.prompt_lock:
+            gemini_dets = list(self.current_gemini_detections)
+        
+        # If no Gemini detections, parse the prompt directly
+        if not gemini_dets and prompt:
+            # Parse "phone. wallet." style prompt
+            objects = [obj.strip() for obj in prompt.replace(".", " ").split() if obj.strip()]
+            objects = list(set(objects))[:5]
+            
+            for obj_name in objects:
+                if len(obj_name) < 2:
+                    continue
+                # Use SAM3 directly with text prompt
+                detections = self.detect_with_sam3(frame, obj_name)
+                all_detections.extend(detections)
+        else:
+            # Use Gemini-extracted objects
+            seen_objects = set()
+            
+            for gd in gemini_dets[:5]:  # Limit to 5 objects
+                obj_name = gd.description.lower().strip()
+                
+                # Skip duplicates
+                if obj_name in seen_objects:
+                    continue
+                seen_objects.add(obj_name)
+                
+                # Try SAM3 with text prompt first
+                detections = self.detect_with_sam3(frame, obj_name)
+                
+                if detections:
+                    all_detections.extend(detections)
+                    print(f"[SAM3] '{obj_name}' detected via text prompt")
+                elif gd.bbox and gd.object_type == "custom":
+                    # For custom/unseen objects, use Gemini bbox as fallback
+                    # Convert normalized bbox to pixels
+                    x1 = int(gd.bbox[0] * w)
+                    y1 = int(gd.bbox[1] * h)
+                    x2 = int(gd.bbox[2] * w)
+                    y2 = int(gd.bbox[3] * h)
+                    
+                    # Validate bbox
+                    x1 = max(0, min(w - 20, x1))
+                    y1 = max(0, min(h - 20, y1))
+                    x2 = max(x1 + 20, min(w, x2))
+                    y2 = max(y1 + 20, min(h, y2))
+                    
+                    # Create simple rectangular mask
+                    mask = np.zeros((h, w), dtype=bool)
+                    mask[y1:y2, x1:x2] = True
+                    
+                    det = DetectedObject(
+                        instance_id=len(all_detections) + 1,
+                        class_name=obj_name[:30],
+                        bbox=(x1, y1, x2, y2),
+                        mask=mask,
+                        confidence=gd.confidence
+                    )
+                    all_detections.append(det)
+                    print(f"[SAM3] '{obj_name}' fallback to Gemini bbox (custom object)")
+                else:
+                    print(f"[SAM3] '{obj_name}' not found")
         
         return all_detections
     
