@@ -1,15 +1,16 @@
 # MotorMaven Live
 
-Real-time multimodal AI assistant powered by Google Gemini Live API with intelligent object segmentation using Grounded SAM2.
+Real-time multimodal AI assistant powered by Google Gemini Live API with intelligent object segmentation using SAM3/SAM2.
 
 ## Features
 
 - **Voice Conversation**: Natural voice chat with Gemini Live API
 - **Video Understanding**: Camera feed sent to Gemini for visual context
-- **Grounded SAM2**: Automatic object detection and segmentation based on speech
+- **SAM3 Text Segmentation**: Direct text-based object segmentation (NEW!)
+- **Grounded SAM2**: Automatic object detection using Grounding DINO + SAM
 - **Voice Responses**: Gemini responds with natural voice
 - **Text Overlay**: Responses displayed on video feed
-- **Multiple SAM Models**: Choose between different SAM model sizes for speed vs accuracy
+- **Multiple SAM Models**: Choose SAM3, SAM2, or SAM1 models for different use cases
 
 ## Architecture
 
@@ -19,9 +20,25 @@ User Speech/Video --> Gemini Live API --> AI Response (Voice + Text)
                            v
                     Object Detection
                            |
+            +--------------+---------------+
+            |                              |
+            v                              v
+   SAM3 (Text Prompts)          DINO + SAM2 (Visual Prompts)
+            |                              |
+            +--------------+---------------+
+                           |
                            v
-         Grounding DINO + SAM2 --> Segmentation Overlay
+                  Segmentation Overlay
 ```
+
+### SAM3 vs SAM2
+
+| Feature | SAM3 | SAM2 |
+|---------|------|------|
+| Input | Text prompts ("phone", "all red objects") | Visual prompts (points, boxes) |
+| Detection | Built-in text understanding | Requires Grounding DINO |
+| Capability | Segments ALL instances of a concept | Segments specific object from prompt |
+| Use Case | Natural language queries | Precise single-object tracking |
 
 ## Requirements
 
@@ -93,7 +110,18 @@ source ~/.bashrc
 
 Note: If you provide an API key in the UI, it will override the environment variable for that session.
 
-### 6. Download SAM Models (Optional)
+### 6. HuggingFace Token for SAM3 (Optional)
+
+SAM3 is a gated model on HuggingFace. To use SAM3:
+
+1. Create a HuggingFace account at https://huggingface.co
+2. Accept the SAM3 model license at https://huggingface.co/facebook/sam3
+3. Create an access token at https://huggingface.co/settings/tokens
+4. Set the token: `export HF_TOKEN="your-huggingface-token"`
+
+Note: SAM2 and SAM1 models work without a HuggingFace token.
+
+### 7. Download SAM Models (Optional)
 
 The models will auto-download from HuggingFace on first run. For faster startup, pre-download:
 
@@ -109,12 +137,27 @@ python download_sam2_models.py --list         # List available models
 
 ## Available SAM Models
 
+### SAM3 (Recommended)
+| Model | Parameters | Description | Speed |
+|-------|-----------|-------------|-------|
+| SAM3 | ~1B | Text prompts, semantic understanding | Medium |
+
+SAM3 is the recommended model - it understands natural language directly:
+- "segment all phones"
+- "highlight red objects"
+- "find the laptop"
+
+### SAM2 (Visual Prompts)
 | Model | Parameters | Description | Speed |
 |-------|-----------|-------------|-------|
 | SAM2 Hiera Tiny | 38.9M | Fastest, good for real-time | Very Fast |
 | SAM2 Hiera Small | 46M | Balanced speed/accuracy | Fast |
 | SAM2 Hiera Base+ | 80.8M | Better accuracy | Medium |
 | SAM2 Hiera Large | 224.4M | Best accuracy | Slower |
+
+### SAM1 (Original)
+| Model | Parameters | Description | Speed |
+|-------|-----------|-------------|-------|
 | SAM ViT-Base | 94M | Original SAM, stable | Medium |
 | SAM ViT-Large | 308M | High quality | Slow |
 | SAM ViT-Huge | 636M | Highest quality | Very Slow |
@@ -181,8 +224,10 @@ DETECTION_INTERVAL_FRAMES = 30
 1. **Voice Capture**: Your speech is captured and sent to Gemini Live API
 2. **Video Stream**: Camera frames are sent at 2 FPS when you're speaking
 3. **AI Processing**: Gemini processes both audio and video for context
-4. **Object Detection**: When you mention objects, Gemini identifies them
-5. **Segmentation**: Grounding DINO + SAM2 segment the objects in real-time
+4. **Object Detection**: When you mention objects, they are extracted from speech
+5. **Segmentation**:
+   - **SAM3 Mode**: Text prompt sent directly to SAM3 for semantic segmentation
+   - **SAM2 Mode**: Grounding DINO detects objects, then SAM2 segments them
 6. **Response**: AI responds with voice and text overlay on video
 
 ### Example Interactions

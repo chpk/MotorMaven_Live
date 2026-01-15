@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import re
+import os
 from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass
 import numpy as np
@@ -431,30 +432,37 @@ IMPORTANT:
 
 class HybridSAMTracker:
     """
-    Hybrid tracker that combines:
-    1. Gemini for specific descriptions + approximate bboxes
-    2. Grounding DINO for text-based detection
-    3. SAM/SAM2 for precise segmentation (multiple model options)
+    Hybrid tracker that supports:
+    - SAM/SAM2: Uses Grounding DINO + SAM for segmentation (visual prompts)
+    - SAM3: Uses text prompts directly for semantic segmentation (no DINO needed!)
     
-    Supports multiple SAM model variants for accuracy/speed tradeoff.
+    SAM3 is more powerful - understands natural language and semantic relations.
     """
     
     # Available SAM models
     SAM_MODELS = {
-        # HuggingFace models (auto-download)
-        "sam-vit-base": {"type": "hf", "id": "facebook/sam-vit-base", "params": "94M"},
-        "sam-vit-large": {"type": "hf", "id": "facebook/sam-vit-large", "params": "308M"},
-        "sam-vit-huge": {"type": "hf", "id": "facebook/sam-vit-huge", "params": "636M"},
-        "sam2-hiera-tiny": {"type": "hf", "id": "facebook/sam2-hiera-tiny", "params": "38.9M"},
-        "sam2-hiera-small": {"type": "hf", "id": "facebook/sam2-hiera-small", "params": "46M"},
-        "sam2-hiera-base-plus": {"type": "hf", "id": "facebook/sam2-hiera-base-plus", "params": "80.8M"},
-        "sam2-hiera-large": {"type": "hf", "id": "facebook/sam2-hiera-large", "params": "224.4M"},
+        # SAM1 models (HuggingFace)
+        "sam-vit-base": {"type": "sam1", "id": "facebook/sam-vit-base", "params": "94M"},
+        "sam-vit-large": {"type": "sam1", "id": "facebook/sam-vit-large", "params": "308M"},
+        "sam-vit-huge": {"type": "sam1", "id": "facebook/sam-vit-huge", "params": "636M"},
+        # SAM2 models (HuggingFace)
+        "sam2-hiera-tiny": {"type": "sam2", "id": "facebook/sam2-hiera-tiny", "params": "38.9M"},
+        "sam2-hiera-small": {"type": "sam2", "id": "facebook/sam2-hiera-small", "params": "46M"},
+        "sam2-hiera-base-plus": {"type": "sam2", "id": "facebook/sam2-hiera-base-plus", "params": "80.8M"},
+        "sam2-hiera-large": {"type": "sam2", "id": "facebook/sam2-hiera-large", "params": "224.4M"},
+        # SAM3 models (HuggingFace) - Text-based segmentation!
+        "sam3": {"type": "sam3", "id": "facebook/sam3", "params": "~1B", "text_based": True},
     }
+    
+    # HuggingFace token for SAM3 (gated model) - set via environment variable
+    # Export HF_TOKEN=your_token or enter in UI
+    HF_TOKEN = os.environ.get("HF_TOKEN", "")
     
     def __init__(self, api_key: str = None, sam_model: str = "sam2-hiera-small"):
         self.device = DEVICE
         self.api_key = api_key
         self.sam_model_name = sam_model
+        self.is_sam3 = "sam3" in sam_model.lower()
         
         # Models
         self.dino_model = None
@@ -462,10 +470,13 @@ class HybridSAMTracker:
         self.sam_model = None
         self.sam_processor = None
         
-        # Gemini extractor
-        if api_key:
+        # Gemini extractor (only needed for SAM1/SAM2, not SAM3)
+        if api_key and not self.is_sam3:
             print(f"[Tracker] Creating Gemini extractor with API key ({len(api_key)} chars)")
             self.gemini_extractor = PreciseGeminiExtractor(api_key)
+        elif self.is_sam3:
+            print("[Tracker] SAM3 mode - using direct text prompts (no Gemini extractor needed)")
+            self.gemini_extractor = None
         else:
             print("[Tracker] WARNING: No API key provided - Gemini extractor disabled!")
             self.gemini_extractor = None
@@ -512,65 +523,124 @@ class HybridSAMTracker:
         """Change the SAM model (requires reload)."""
         if model_name in self.SAM_MODELS:
             self.sam_model_name = model_name
+            self.is_sam3 = "sam3" in model_name.lower()
             self.models_loaded = False
             self.sam_model = None
             self.sam_processor = None
-            print(f"[Tracker] SAM model set to: {model_name}")
+            self.dino_model = None
+            self.dino_processor = None
+            print(f"[Tracker] SAM model set to: {model_name} (SAM3={self.is_sam3})")
         else:
             print(f"[Tracker] Unknown model: {model_name}")
     
     def load_models(self) -> bool:
-        """Load Grounding DINO and selected SAM model."""
+        """Load Grounding DINO (for SAM1/SAM2) and selected SAM model."""
         if self.models_loaded:
             return True
         
         try:
             import warnings
-            from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
             
-            # Load Grounding DINO
-            print("[Tracker] Loading Grounding DINO...")
-            self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
-            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-                "IDEA-Research/grounding-dino-tiny"
-            ).to(self.device)
-            self.dino_model.eval()
-            
-            # Load selected SAM model
             sam_info = self.SAM_MODELS.get(self.sam_model_name)
             if not sam_info:
                 print(f"[Tracker] Unknown SAM model: {self.sam_model_name}, using default")
                 sam_info = self.SAM_MODELS["sam2-hiera-small"]
                 self.sam_model_name = "sam2-hiera-small"
+                self.is_sam3 = False
             
-            print(f"[Tracker] Loading SAM: {self.sam_model_name} ({sam_info['params']})...")
-            
-            # Load from HuggingFace
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore")
-                
-                if "sam2" in self.sam_model_name:
-                    # SAM2 models
-                    from transformers import Sam2Model, Sam2Processor
-                    self.sam_processor = Sam2Processor.from_pretrained(sam_info["id"])
-                    self.sam_model = Sam2Model.from_pretrained(sam_info["id"]).to(self.device)
-                else:
-                    # Original SAM models
-                    from transformers import SamModel, SamProcessor
-                    self.sam_processor = SamProcessor.from_pretrained(sam_info["id"])
-                    self.sam_model = SamModel.from_pretrained(sam_info["id"]).to(self.device)
-                
-                self.sam_model.eval()
-            
-            self.models_loaded = True
-            print(f"[Tracker] All models loaded! (SAM: {self.sam_model_name})")
-            return True
+            # SAM3 uses text prompts directly - no need for Grounding DINO!
+            if self.is_sam3:
+                return self._load_sam3_models(sam_info)
+            else:
+                return self._load_sam2_models(sam_info)
             
         except Exception as e:
             print(f"[Tracker] Load failed: {e}")
             import traceback
             traceback.print_exc()
             return False
+    
+    def _load_sam3_models(self, sam_info: dict) -> bool:
+        """Load SAM3 model - text-based segmentation (no DINO needed!)."""
+        import warnings
+        
+        print(f"[Tracker] Loading SAM3 ({sam_info['params']}) - Text-based segmentation!")
+        print("[Tracker] SAM3 understands natural language directly - no Grounding DINO needed")
+        
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                
+                from transformers import Sam3Processor, Sam3Model
+                
+                # Login to HuggingFace for gated model access
+                try:
+                    from huggingface_hub import login
+                    login(token=self.HF_TOKEN, add_to_git_credential=False)
+                    print("[Tracker] HuggingFace login successful")
+                except Exception as login_err:
+                    print(f"[Tracker] HuggingFace login warning: {login_err}")
+                
+                # Load SAM3 model
+                self.sam_processor = Sam3Processor.from_pretrained(
+                    sam_info["id"], 
+                    token=self.HF_TOKEN
+                )
+                self.sam_model = Sam3Model.from_pretrained(
+                    sam_info["id"], 
+                    token=self.HF_TOKEN
+                ).to(self.device)
+                self.sam_model.eval()
+                
+            self.models_loaded = True
+            print(f"[Tracker] SAM3 loaded! Use text prompts like 'phone', 'all red objects', etc.")
+            return True
+            
+        except ImportError as e:
+            print(f"[Tracker] SAM3 not available in transformers: {e}")
+            print("[Tracker] Try: pip install transformers>=4.40.0")
+            return False
+        except Exception as e:
+            print(f"[Tracker] SAM3 load failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _load_sam2_models(self, sam_info: dict) -> bool:
+        """Load Grounding DINO + SAM1/SAM2 models."""
+        import warnings
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        
+        # Load Grounding DINO (needed for SAM1/SAM2)
+        print("[Tracker] Loading Grounding DINO...")
+        self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            "IDEA-Research/grounding-dino-tiny"
+        ).to(self.device)
+        self.dino_model.eval()
+        
+        print(f"[Tracker] Loading SAM: {self.sam_model_name} ({sam_info['params']})...")
+        
+        # Load SAM1 or SAM2 from HuggingFace
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            
+            if sam_info["type"] == "sam2":
+                # SAM2 models
+                from transformers import Sam2Model, Sam2Processor
+                self.sam_processor = Sam2Processor.from_pretrained(sam_info["id"])
+                self.sam_model = Sam2Model.from_pretrained(sam_info["id"]).to(self.device)
+            else:
+                # Original SAM1 models
+                from transformers import SamModel, SamProcessor
+                self.sam_processor = SamProcessor.from_pretrained(sam_info["id"])
+                self.sam_model = SamModel.from_pretrained(sam_info["id"]).to(self.device)
+            
+            self.sam_model.eval()
+        
+        self.models_loaded = True
+        print(f"[Tracker] All models loaded! (SAM: {self.sam_model_name})")
+        return True
     
     def set_prompt(self, prompt: str):
         with self.prompt_lock:
@@ -867,14 +937,82 @@ class HybridSAMTracker:
             print(f"[Tracker] SAM error: {e}")
             return detections
     
+    @torch.inference_mode()
+    def detect_with_sam3(self, frame: np.ndarray, text_prompt: str) -> List[DetectedObject]:
+        """
+        SAM3 text-based detection - segments ALL instances of the concept!
+        Much simpler than SAM2: just pass text, get masks.
+        """
+        if not self.models_loaded or not self.is_sam3:
+            return []
+        
+        try:
+            pil_image = Image.fromarray(frame)
+            h, w = frame.shape[:2]
+            
+            # SAM3 takes text prompt directly
+            inputs = self.sam_processor(
+                images=pil_image, 
+                text=text_prompt, 
+                return_tensors="pt"
+            ).to(self.device)
+            
+            outputs = self.sam_model(**inputs)
+            
+            # Post-process to get instance masks
+            results = self.sam_processor.post_process_instance_segmentation(
+                outputs,
+                threshold=0.5,
+                mask_threshold=0.5,
+                target_sizes=[(h, w)]
+            )[0]
+            
+            detections = []
+            masks = results.get("masks", [])
+            boxes = results.get("boxes", [])
+            scores = results.get("scores", [])
+            
+            for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+                if score < 0.3:  # Skip low confidence
+                    continue
+                
+                # Convert box to integers
+                if hasattr(box, 'cpu'):
+                    box = box.cpu().numpy()
+                x1, y1, x2, y2 = map(int, box)
+                
+                # Convert mask to numpy
+                if hasattr(mask, 'cpu'):
+                    mask_np = mask.cpu().numpy()
+                else:
+                    mask_np = np.array(mask)
+                
+                det = DetectedObject(
+                    instance_id=i + 1,
+                    class_name=text_prompt[:30],
+                    bbox=(x1, y1, x2, y2),
+                    mask=mask_np > 0.5,
+                    confidence=float(score)
+                )
+                detections.append(det)
+            
+            if detections:
+                print(f"[SAM3] Found {len(detections)} '{text_prompt}' instance(s)")
+            
+            return detections
+            
+        except Exception as e:
+            print(f"[SAM3] Detection error: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[DetectedObject]]:
         """
-        Process frame with smart hybrid detection.
+        Process frame with smart detection.
         
-        Strategy:
-        1. ALWAYS try DINO first for ALL objects (it's good at generic objects)
-        2. ONLY use Gemini bbox for CUSTOM objects when DINO fails
-        3. Never use Gemini bbox for generic objects like phone, wallet, etc.
+        For SAM3: Uses text prompts directly (semantic understanding)
+        For SAM1/SAM2: Uses DINO + SAM (visual prompts)
         """
         prompt = self.get_prompt()
         
@@ -891,61 +1029,13 @@ class HybridSAMTracker:
         )
         
         if need_detection:
-            # Step 1: Try DINO for everything
-            detections = self.detect_with_dino(frame, prompt)
-            dino_found = {d.class_name.lower() for d in detections}
+            # SAM3: Use text-based detection (much simpler!)
+            if self.is_sam3:
+                detections = self._process_frame_sam3(frame, prompt)
+            else:
+                detections = self._process_frame_sam2(frame, prompt)
             
             if detections:
-                print(f"[DINO] Found: {list(dino_found)}")
-            
-            # Step 2: Check if there are CUSTOM objects that DINO missed
-            with self.prompt_lock:
-                gemini_dets = list(self.current_gemini_detections)
-            
-            # Only add Gemini bbox for CUSTOM objects that DINO couldn't find
-            for gd in gemini_dets:
-                desc_lower = gd.description.lower()
-                
-                # Skip if DINO already found something similar
-                found_match = any(
-                    desc_lower in found or found in desc_lower 
-                    for found in dino_found
-                )
-                if found_match:
-                    continue
-                
-                # Only use Gemini bbox if:
-                # 1. It's a CUSTOM object (not generic)
-                # 2. It has a valid bbox
-                # 3. DINO didn't find it
-                is_custom = not self._is_generic_object(gd.description)
-                has_bbox = gd.bbox is not None and len(gd.bbox) == 4
-                
-                if is_custom and has_bbox:
-                    h, w = frame.shape[:2]
-                    x1 = int(gd.bbox[0] * w)
-                    y1 = int(gd.bbox[1] * h)
-                    x2 = int(gd.bbox[2] * w)
-                    y2 = int(gd.bbox[3] * h)
-                    
-                    # Validate bbox
-                    x1 = max(0, min(w - 20, x1))
-                    y1 = max(0, min(h - 20, y1))
-                    x2 = max(x1 + 20, min(w, x2))
-                    y2 = max(y1 + 20, min(h, y2))
-                    
-                    det = DetectedObject(
-                        instance_id=len(detections) + 1,
-                        class_name=gd.description[:30],
-                        bbox=(x1, y1, x2, y2),
-                        confidence=0.7
-                    )
-                    detections.append(det)
-                    print(f"[Tracker] Added custom bbox: {gd.description}")
-            
-            # Segment all detections
-            if detections:
-                detections = self.segment(frame, detections)
                 self.last_detections = detections
                 print(f"[Tracker] Total: {len(detections)} object(s)")
             else:
@@ -953,13 +1043,89 @@ class HybridSAMTracker:
         else:
             detections = self.last_detections
             
-            # Update masks periodically for tracking
-            if self.frame_count % 10 == 0 and detections:
+            # Update masks periodically for tracking (only for SAM2)
+            if not self.is_sam3 and self.frame_count % 10 == 0 and detections:
                 detections = self.segment(frame, detections)
                 self.last_detections = detections
         
         annotated = self.annotate_frame(frame, detections)
         return annotated, detections
+    
+    def _process_frame_sam3(self, frame: np.ndarray, prompt: str) -> List[DetectedObject]:
+        """Process frame using SAM3 text-based segmentation."""
+        # Parse prompt - may contain multiple objects like "phone. wallet."
+        # SAM3 can handle each concept
+        objects = [obj.strip() for obj in prompt.replace(".", " ").split() if obj.strip()]
+        objects = list(set(objects))[:5]  # Limit to 5 unique objects
+        
+        all_detections = []
+        for obj_name in objects:
+            if len(obj_name) < 2:
+                continue
+            detections = self.detect_with_sam3(frame, obj_name)
+            all_detections.extend(detections)
+        
+        return all_detections
+    
+    def _process_frame_sam2(self, frame: np.ndarray, prompt: str) -> List[DetectedObject]:
+        """Process frame using DINO + SAM2 (visual prompts)."""
+        # Step 1: Try DINO for everything
+        detections = self.detect_with_dino(frame, prompt)
+        dino_found = {d.class_name.lower() for d in detections}
+        
+        if detections:
+            print(f"[DINO] Found: {list(dino_found)}")
+        
+        # Step 2: Check if there are CUSTOM objects that DINO missed
+        with self.prompt_lock:
+            gemini_dets = list(self.current_gemini_detections)
+        
+        # Only add Gemini bbox for CUSTOM objects that DINO couldn't find
+        for gd in gemini_dets:
+            desc_lower = gd.description.lower()
+            
+            # Skip if DINO already found something similar
+            found_match = any(
+                desc_lower in found or found in desc_lower 
+                for found in dino_found
+            )
+            if found_match:
+                continue
+            
+            # Only use Gemini bbox if:
+            # 1. It's a CUSTOM object (not generic)
+            # 2. It has a valid bbox
+            # 3. DINO didn't find it
+            is_custom = not self._is_generic_object(gd.description)
+            has_bbox = gd.bbox is not None and len(gd.bbox) == 4
+            
+            if is_custom and has_bbox:
+                h, w = frame.shape[:2]
+                x1 = int(gd.bbox[0] * w)
+                y1 = int(gd.bbox[1] * h)
+                x2 = int(gd.bbox[2] * w)
+                y2 = int(gd.bbox[3] * h)
+                
+                # Validate bbox
+                x1 = max(0, min(w - 20, x1))
+                y1 = max(0, min(h - 20, y1))
+                x2 = max(x1 + 20, min(w, x2))
+                y2 = max(y1 + 20, min(h, y2))
+                
+                det = DetectedObject(
+                    instance_id=len(detections) + 1,
+                    class_name=gd.description[:30],
+                    bbox=(x1, y1, x2, y2),
+                    confidence=0.7
+                )
+                detections.append(det)
+                print(f"[Tracker] Added custom bbox: {gd.description}")
+        
+        # Segment all detections
+        if detections:
+            detections = self.segment(frame, detections)
+        
+        return detections
     
     def _is_generic_object(self, description: str) -> bool:
         """Check if object is generic (DINO handles well) or custom (needs Gemini bbox)."""

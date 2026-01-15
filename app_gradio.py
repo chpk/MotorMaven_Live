@@ -409,7 +409,7 @@ class GeminiLiveSession:
         self.sam_tracker = None
         self.sam_enabled = False
         self.sam_prompt = ""
-        self.sam_model = "sam2-hiera-small"  # Default model
+        self.sam_model = "sam3"  # Default model (SAM3 uses text prompts!)
         
         # Queues
         self.audio_in_q = asyncio.Queue()
@@ -483,7 +483,7 @@ class GeminiLiveSession:
     def get_transcript(self):
         return "\n".join(self.transcript[-20:])
     
-    def set_devices(self, mic, speaker, camera, voice, sam_enabled, sam_model="sam2-hiera-small", api_key=""):
+    def set_devices(self, mic, speaker, camera, voice, sam_enabled, sam_model="sam3", api_key=""):
         self.mic_idx = mic
         self.speaker_idx = speaker
         self.camera_idx = camera
@@ -1216,6 +1216,7 @@ def create_ui():
             with gr.Row():
                 # SAM Model Selection
                 sam_model_choices = [
+                    ("SAM3 (~1B) - TEXT PROMPTS - Best!", "sam3"),
                     ("SAM2 Tiny (38.9M) - Fastest", "sam2-hiera-tiny"),
                     ("SAM2 Small (46M) - Balanced", "sam2-hiera-small"),
                     ("SAM2 Base+ (80.8M) - Better Accuracy", "sam2-hiera-base-plus"),
@@ -1226,10 +1227,10 @@ def create_ui():
                 ]
                 sam_model = gr.Dropdown(
                     choices=sam_model_choices,
-                    value="sam2-hiera-small",
+                    value="sam3",
                     label="SAM Model",
                     scale=2,
-                    info="Larger models = better accuracy, slower speed"
+                    info="SAM3 uses text prompts directly (recommended). SAM2/SAM1 use visual prompts."
                 )
                 sam_prompt_box = gr.Textbox(
                     label="SAM Prompt (auto-generated)",
