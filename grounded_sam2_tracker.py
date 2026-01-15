@@ -64,35 +64,62 @@ class GeminiDetection:
 class PreciseGeminiExtractor:
     """
     Extracts specific objects with accurate bounding boxes.
-    Works for both common objects AND custom/industrial objects.
+    Uses intent classification to determine if bbox is needed.
     """
     
-    SYSTEM_PROMPT = """You are a precise object detector. Identify ALL objects mentioned by the user.
-
-TASK: Look at the image and find EVERY object the user is asking about.
+    # Objects that Grounding DINO handles well - NO bbox needed from Gemini
+    GENERIC_OBJECTS = {
+        "phone", "smartphone", "mobile", "cellphone", "iphone", "android",
+        "wallet", "purse", "bag", "backpack", "handbag",
+        "bottle", "cup", "mug", "glass", "can",
+        "laptop", "computer", "keyboard", "mouse", "monitor", "screen",
+        "pen", "pencil", "marker", "eraser", "book", "notebook", "paper",
+        "chair", "table", "desk", "sofa", "couch", "bed",
+        "door", "window", "wall", "floor", "ceiling",
+        "car", "vehicle", "truck", "bus", "motorcycle", "bicycle",
+        "person", "man", "woman", "child", "face", "hand",
+        "cat", "dog", "bird", "animal",
+        "plant", "flower", "tree", "leaf",
+        "food", "fruit", "apple", "banana", "orange",
+        "clock", "watch", "tv", "television", "remote",
+        "shoe", "shirt", "pants", "hat", "glasses",
+        "box", "container", "package",
+        "light", "lamp", "fan", "ac", "air conditioner",
+        "refrigerator", "fridge", "microwave", "oven", "stove",
+    }
+    
+    # Objects that need Gemini bbox (custom/industrial/text)
+    CUSTOM_KEYWORDS = {
+        "motor", "terminal", "connector", "wire", "cable", "circuit",
+        "screw", "bolt", "nut", "washer", "gear", "bearing",
+        "valve", "pump", "sensor", "switch", "button", "knob",
+        "label", "sign", "text", "writing", "logo", "brand", "sticker",
+        "warning", "caution", "serial", "number", "code", "barcode", "qr",
+        "part", "component", "module", "unit", "assembly",
+        "positive", "negative", "ground", "power", "input", "output",
+        "red wire", "blue wire", "black wire", "yellow wire",
+        "specific", "particular", "this", "that",
+    }
+    
+    SYSTEM_PROMPT = """You are an object identifier. Identify ONLY the objects the user mentions.
 
 OUTPUT FORMAT (JSON only):
 {"objects":[
-  {"description":"simple_name", "bbox":[x1, y1, x2, y2]},
-  {"description":"simple_name", "bbox":[x1, y1, x2, y2]}
+  {"description":"simple_name", "type":"generic|custom", "bbox":[x1,y1,x2,y2]}
 ]}
 
-CRITICAL RULES:
-1. Include ALL objects the user mentions - if they say "phone and wallet", include BOTH
-2. Use simple 1-2 word descriptions: "phone", "wallet", "red mug", "motor", "terminal"
-3. BBOX must be accurate normalized coordinates [0.0-1.0]: [left, top, right, bottom]
+RULES:
+1. "description": Simple 1-2 word name (phone, wallet, motor, terminal)
+2. "type": 
+   - "generic" for common objects (phone, wallet, cup, chair, person)
+   - "custom" for industrial/text/specific items (motor, terminal, label, specific text)
+3. "bbox": ONLY provide bbox for "custom" type objects. For "generic", use null.
 
-BBOX EXAMPLES:
-- Left object: [0.05, 0.2, 0.4, 0.8]
-- Right object: [0.6, 0.2, 0.95, 0.8]  
-- Center object: [0.25, 0.25, 0.75, 0.75]
-- Top-left small: [0.05, 0.05, 0.3, 0.35]
+BBOX FORMAT (only for custom objects):
+- Normalized 0.0-1.0 coordinates: [left, top, right, bottom]
+- Be VERY precise for custom/industrial objects
 
-For CUSTOM objects (motors, terminals, screws, text/signs, labels):
-- Provide ACCURATE bounding boxes since detection models may not recognize them
-- Be very precise with bbox coordinates
-
-Return JSON only."""
+Return JSON only. No explanation."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -110,9 +137,31 @@ Return JSON only."""
                     except Exception as e:
                         print(f"[GeminiExtractor] Init failed: {e}")
     
+    def is_generic_object(self, description: str) -> bool:
+        """Check if object is generic (DINO can handle) or custom (needs bbox)."""
+        desc_lower = description.lower().strip()
+        
+        # Check against generic objects list
+        for generic in self.GENERIC_OBJECTS:
+            if generic in desc_lower or desc_lower in generic:
+                return True
+        
+        # Check if it contains custom keywords
+        for custom in self.CUSTOM_KEYWORDS:
+            if custom in desc_lower:
+                return False
+        
+        # Default: if it's a simple common noun, it's probably generic
+        simple_words = desc_lower.split()
+        if len(simple_words) <= 2:
+            # Single/double word objects are often generic
+            return True
+        
+        return False
+    
     def extract(self, frame: np.ndarray, text: str, frame_size: Tuple[int, int]) -> List[GeminiDetection]:
         """
-        Extract ALL objects mentioned by the user with accurate bboxes.
+        Extract objects mentioned by user. Only provides bbox for custom/text/unseen objects.
         """
         self._ensure_client()
         if self.client is None:
@@ -120,24 +169,22 @@ Return JSON only."""
             return self._fallback(text, frame_size)
         
         try:
-            # Convert frame to JPEG
+            # Convert frame to JPEG (lower quality for faster processing)
             pil_img = Image.fromarray(frame)
             buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=75)
+            pil_img.save(buf, format="JPEG", quality=60)
             img_b64 = base64.b64encode(buf.getvalue()).decode()
             
             prompt = f"""{self.SYSTEM_PROMPT}
 
 User's request: "{text}"
 
-Instructions:
-- Find ALL objects mentioned in the user's request
-- If user says "highlight X and Y" - include BOTH X and Y
-- If user asks "what is this" - identify the main object being shown
-- Provide accurate bounding boxes for each object
-- For custom/industrial/text objects, be extra precise with bbox
-
-Return JSON with ALL requested objects."""
+IMPORTANT:
+- Identify ONLY the specific objects the user is asking about
+- Do NOT include random background objects
+- For common objects (phone, wallet, cup, person), set type="generic" and bbox=null
+- For industrial/text/specific items (motor, terminal, label, specific text), set type="custom" with precise bbox
+- Be conservative - only include objects actually mentioned by the user"""
             
             response = self.client.models.generate_content(
                 model="gemini-2.0-flash",
@@ -148,30 +195,40 @@ Return JSON with ALL requested objects."""
             )
             
             result = response.text.strip()
-            print(f"[GeminiExtractor] Raw response: {result[:400]}")
+            print(f"[GeminiExtractor] Response: {result[:300]}")
             
             # Parse JSON response
             detections = self._parse_response(result)
             
-            # Validate and fix bboxes
+            # Process detections with intent classification
             valid_detections = []
             for d in detections:
-                if d.bbox is None:
-                    d.bbox = (0.2, 0.2, 0.8, 0.8)  # Default center region
-                    print(f"[GeminiExtractor] '{d.description}' - no bbox, using default")
-                else:
-                    # Validate bbox values are in 0-1 range
+                is_generic = self.is_generic_object(d.description)
+                
+                if is_generic:
+                    # Generic object - DINO will handle it, no bbox needed
+                    d.bbox = None
+                    print(f"[GeminiExtractor] '{d.description}' (generic - DINO will detect)")
+                elif d.bbox is not None:
+                    # Custom object with bbox - validate coordinates
                     x1, y1, x2, y2 = d.bbox
                     x1 = max(0.0, min(1.0, x1))
                     y1 = max(0.0, min(1.0, y1))
                     x2 = max(0.0, min(1.0, x2))
                     y2 = max(0.0, min(1.0, y2))
-                    if x2 > x1 and y2 > y1:
-                        d.bbox = (x1, y1, x2, y2)
-                        print(f"[GeminiExtractor] '{d.description}' at bbox={d.bbox}")
-                    else:
-                        d.bbox = (0.2, 0.2, 0.8, 0.8)
-                        print(f"[GeminiExtractor] '{d.description}' - invalid bbox, using default")
+                    
+                    # Ensure proper ordering and minimum size
+                    if x2 <= x1: x1, x2 = x2, x1
+                    if y2 <= y1: y1, y2 = y2, y1
+                    if x2 - x1 < 0.05: x2 = min(1.0, x1 + 0.1)
+                    if y2 - y1 < 0.05: y2 = min(1.0, y1 + 0.1)
+                    
+                    d.bbox = (x1, y1, x2, y2)
+                    print(f"[GeminiExtractor] '{d.description}' (custom) bbox={d.bbox}")
+                else:
+                    # Custom but no bbox - will use fallback
+                    print(f"[GeminiExtractor] '{d.description}' (custom, no bbox)")
+                
                 valid_detections.append(d)
             
             if valid_detections:
@@ -187,7 +244,7 @@ Return JSON with ALL requested objects."""
             return self._fallback(text, frame_size)
     
     def _parse_response(self, response: str) -> List[GeminiDetection]:
-        """Parse Gemini's JSON response - robust extraction with fallbacks."""
+        """Parse Gemini's JSON response - only keeps bbox for custom objects."""
         detections = []
         
         try:
@@ -218,21 +275,24 @@ Return JSON with ALL requested objects."""
                 if not isinstance(objects, list):
                     objects = [objects]
                 
-                for obj in objects[:10]:  # Allow up to 10 objects
+                for obj in objects[:5]:  # Limit to 5 objects to reduce noise
                     if isinstance(obj, dict):
                         desc = obj.get("description", obj.get("name", "")).strip()
+                        obj_type = obj.get("type", "generic").lower()
                         bbox = obj.get("bbox", obj.get("bounding_box", obj.get("box")))
                         
                         if not desc:
                             continue
                         
-                        # Parse bbox
-                        valid_bbox = self._parse_bbox(bbox)
+                        # Only use bbox for custom objects, not generic ones
+                        valid_bbox = None
+                        if obj_type == "custom" and bbox:
+                            valid_bbox = self._parse_bbox(bbox)
                         
                         detections.append(GeminiDetection(
                             description=desc,
                             bbox=valid_bbox,
-                            confidence=0.85
+                            confidence=0.85 if obj_type == "custom" else 0.9
                         ))
             
             # Fallback: extract description with regex if JSON parsing failed
@@ -241,9 +301,10 @@ Return JSON with ALL requested objects."""
                 desc_matches = re.findall(r'"description"\s*:\s*"([^"]+)"', response)
                 for desc in desc_matches[:3]:
                     if desc and len(desc) > 2:
+                        # No bbox for fallback - let DINO handle it
                         detections.append(GeminiDetection(
                             description=desc.strip(),
-                            bbox=(0.2, 0.2, 0.8, 0.8),  # Default center bbox
+                            bbox=None,
                             confidence=0.7
                         ))
             
@@ -665,8 +726,9 @@ class HybridSAMTracker:
     
     def detect_with_gemini_bbox(self, image: np.ndarray) -> List[DetectedObject]:
         """
-        Use Gemini's bounding boxes for custom/unseen objects.
-        Critical for: motors, terminals, text, signs, industrial parts
+        Use Gemini's bounding boxes ONLY for custom/unseen objects.
+        Only returns objects that have valid bbox (custom objects).
+        Generic objects should be handled by DINO, not here.
         """
         detected = []
         
@@ -679,28 +741,41 @@ class HybridSAMTracker:
         h, w = image.shape[:2]
         
         for i, gd in enumerate(gemini_dets):
-            # Use Gemini's bbox if available, otherwise use center region
-            if gd.bbox and len(gd.bbox) >= 4:
-                bbox = gd.bbox
-            else:
-                # Default center region for objects without bbox
-                bbox = (0.2, 0.2, 0.8, 0.8)
+            # ONLY use Gemini bbox if:
+            # 1. It's a custom object (not generic)
+            # 2. It has a valid bbox from Gemini
+            is_generic = self._is_generic_object(gd.description) if hasattr(self, '_is_generic_object') else False
+            
+            if is_generic:
+                # Skip generic objects - DINO should handle them
+                continue
+            
+            if not gd.bbox or len(gd.bbox) < 4:
+                # No valid bbox - can't use Gemini detection
+                continue
             
             # Convert normalized (0-1) to absolute pixel coordinates
-            x1 = int(bbox[0] * w)
-            y1 = int(bbox[1] * h)
-            x2 = int(bbox[2] * w)
-            y2 = int(bbox[3] * h)
+            x1 = int(gd.bbox[0] * w)
+            y1 = int(gd.bbox[1] * h)
+            x2 = int(gd.bbox[2] * w)
+            y2 = int(gd.bbox[3] * h)
             
-            # Ensure valid bounds
-            x1 = max(0, min(w - 10, x1))
-            y1 = max(0, min(h - 10, y1))
+            # Ensure valid bounds with minimum size
+            x1 = max(0, min(w - 30, x1))
+            y1 = max(0, min(h - 30, y1))
             x2 = max(x1 + 30, min(w, x2))
             y2 = max(y1 + 30, min(h, y2))
             
+            # Skip if bbox is too large (probably hallucinated)
+            bbox_area = (x2 - x1) * (y2 - y1)
+            frame_area = w * h
+            if bbox_area > frame_area * 0.7:  # More than 70% of frame is suspicious
+                print(f"[Tracker] Skipping large bbox for '{gd.description}'")
+                continue
+            
             detected.append(DetectedObject(
-                instance_id=i + 1,
-                class_name=gd.description[:40],
+                instance_id=len(detected) + 1,
+                class_name=gd.description[:30],
                 bbox=(x1, y1, x2, y2),
                 confidence=gd.confidence
             ))
@@ -794,12 +869,12 @@ class HybridSAMTracker:
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[DetectedObject]]:
         """
-        Process frame with hybrid detection.
+        Process frame with smart hybrid detection.
         
         Strategy:
-        1. Try DINO for common objects
-        2. Use Gemini bbox for custom/unseen objects
-        3. Combine both if needed
+        1. ALWAYS try DINO first for ALL objects (it's good at generic objects)
+        2. ONLY use Gemini bbox for CUSTOM objects when DINO fails
+        3. Never use Gemini bbox for generic objects like phone, wallet, etc.
         """
         prompt = self.get_prompt()
         
@@ -812,47 +887,99 @@ class HybridSAMTracker:
         # Re-detect periodically or when no detections
         need_detection = (
             not self.last_detections or 
-            self.frame_count % 20 == 1  # More frequent updates
+            self.frame_count % 25 == 1  # Less frequent to reduce noise
         )
         
         if need_detection:
-            # Strategy 1: Try DINO
+            # Step 1: Try DINO for everything
             detections = self.detect_with_dino(frame, prompt)
+            dino_found = {d.class_name.lower() for d in detections}
             
-            # Strategy 2: Get Gemini bboxes for comparison/fallback
+            if detections:
+                print(f"[DINO] Found: {list(dino_found)}")
+            
+            # Step 2: Check if there are CUSTOM objects that DINO missed
             with self.prompt_lock:
-                gemini_count = len(self.current_gemini_detections)
+                gemini_dets = list(self.current_gemini_detections)
             
-            # If DINO found fewer than Gemini suggested, add Gemini bboxes
-            if len(detections) < gemini_count:
-                gemini_dets = self.detect_with_gemini_bbox(frame)
+            # Only add Gemini bbox for CUSTOM objects that DINO couldn't find
+            for gd in gemini_dets:
+                desc_lower = gd.description.lower()
                 
-                # Add Gemini detections that DINO missed
-                existing_labels = {d.class_name.lower() for d in detections}
-                for gd in gemini_dets:
-                    if gd.class_name.lower() not in existing_labels:
-                        detections.append(gd)
-                        print(f"[Tracker] Added Gemini bbox: {gd.class_name}")
+                # Skip if DINO already found something similar
+                found_match = any(
+                    desc_lower in found or found in desc_lower 
+                    for found in dino_found
+                )
+                if found_match:
+                    continue
+                
+                # Only use Gemini bbox if:
+                # 1. It's a CUSTOM object (not generic)
+                # 2. It has a valid bbox
+                # 3. DINO didn't find it
+                is_custom = not self._is_generic_object(gd.description)
+                has_bbox = gd.bbox is not None and len(gd.bbox) == 4
+                
+                if is_custom and has_bbox:
+                    h, w = frame.shape[:2]
+                    x1 = int(gd.bbox[0] * w)
+                    y1 = int(gd.bbox[1] * h)
+                    x2 = int(gd.bbox[2] * w)
+                    y2 = int(gd.bbox[3] * h)
+                    
+                    # Validate bbox
+                    x1 = max(0, min(w - 20, x1))
+                    y1 = max(0, min(h - 20, y1))
+                    x2 = max(x1 + 20, min(w, x2))
+                    y2 = max(y1 + 20, min(h, y2))
+                    
+                    det = DetectedObject(
+                        instance_id=len(detections) + 1,
+                        class_name=gd.description[:30],
+                        bbox=(x1, y1, x2, y2),
+                        confidence=0.7
+                    )
+                    detections.append(det)
+                    print(f"[Tracker] Added custom bbox: {gd.description}")
             
-            # If still no detections, use only Gemini
-            if not detections:
-                detections = self.detect_with_gemini_bbox(frame)
-                print(f"[Tracker] Using Gemini bboxes only: {len(detections)}")
-            
+            # Segment all detections
             if detections:
                 detections = self.segment(frame, detections)
                 self.last_detections = detections
                 print(f"[Tracker] Total: {len(detections)} object(s)")
+            else:
+                self.last_detections = []
         else:
             detections = self.last_detections
             
-            # Update masks for tracking
-            if self.frame_count % 8 == 0 and detections:
+            # Update masks periodically for tracking
+            if self.frame_count % 10 == 0 and detections:
                 detections = self.segment(frame, detections)
                 self.last_detections = detections
         
         annotated = self.annotate_frame(frame, detections)
         return annotated, detections
+    
+    def _is_generic_object(self, description: str) -> bool:
+        """Check if object is generic (DINO handles well) or custom (needs Gemini bbox)."""
+        desc_lower = description.lower().strip()
+        
+        # Generic objects that DINO handles well
+        generic_objects = {
+            "phone", "smartphone", "mobile", "wallet", "purse", "bag",
+            "bottle", "cup", "mug", "glass", "laptop", "computer", "keyboard",
+            "mouse", "monitor", "pen", "pencil", "book", "paper", "chair",
+            "table", "desk", "door", "window", "car", "person", "man", "woman",
+            "cat", "dog", "plant", "flower", "clock", "watch", "tv", "remote",
+            "shoe", "shirt", "hat", "glasses", "box", "light", "lamp", "fan",
+        }
+        
+        for generic in generic_objects:
+            if generic in desc_lower:
+                return True
+        
+        return False
     
     def annotate_frame(self, frame: np.ndarray, detections: List[DetectedObject]) -> np.ndarray:
         """Annotate frame with segmentation masks ONLY (no labels)."""
