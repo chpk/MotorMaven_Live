@@ -486,6 +486,7 @@ class HybridSAMTracker:
         self.current_gemini_detections: List[GeminiDetection] = []
         self.prompt_lock = threading.Lock()
         self.models_loaded = False
+        self.sam3_use_hf = False  # Flag for HuggingFace SAM3 fallback
         
         # Detection settings
         self.detection_threshold = 0.15
@@ -571,35 +572,59 @@ class HybridSAMTracker:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore")
                 
-                from transformers import Sam3Processor, Sam3Model
-                
-                # Login to HuggingFace for gated model access
+                # SAM3 uses native sam3 package, NOT HuggingFace transformers
+                # Install via: pip install 'git+https://github.com/facebookresearch/sam3.git'
                 try:
-                    from huggingface_hub import login
-                    login(token=self.HF_TOKEN, add_to_git_credential=False)
-                    print("[Tracker] HuggingFace login successful")
-                except Exception as login_err:
-                    print(f"[Tracker] HuggingFace login warning: {login_err}")
-                
-                # Load SAM3 model
-                self.sam_processor = Sam3Processor.from_pretrained(
-                    sam_info["id"], 
-                    token=self.HF_TOKEN
-                )
-                self.sam_model = Sam3Model.from_pretrained(
-                    sam_info["id"], 
-                    token=self.HF_TOKEN
-                ).to(self.device)
-                self.sam_model.eval()
-                
-            self.models_loaded = True
-            print(f"[Tracker] SAM3 loaded! Use text prompts like 'phone', 'all red objects', etc.")
-            return True
+                    from sam3.model_builder import build_sam3_image_model
+                    from sam3.model.sam3_image_processor import Sam3Processor
+                    
+                    print("[Tracker] Building SAM3 image model...")
+                    self.sam_model = build_sam3_image_model()
+                    self.sam_processor = Sam3Processor(self.sam_model)
+                    
+                    self.models_loaded = True
+                    print(f"[Tracker] SAM3 loaded! Use text prompts like 'phone', 'all red objects', etc.")
+                    return True
+                    
+                except ImportError as e:
+                    print(f"[Tracker] sam3 package not installed: {e}")
+                    print("[Tracker] Install SAM3: pip install 'git+https://github.com/facebookresearch/sam3.git'")
+                    
+                    # Fallback: try HuggingFace transformers (if available)
+                    print("[Tracker] Trying HuggingFace transformers fallback...")
+                    try:
+                        from transformers import Sam3Processor, Sam3Model
+                        
+                        # Login to HuggingFace for gated model access
+                        if self.HF_TOKEN:
+                            try:
+                                from huggingface_hub import login
+                                login(token=self.HF_TOKEN, add_to_git_credential=False)
+                                print("[Tracker] HuggingFace login successful")
+                            except Exception as login_err:
+                                print(f"[Tracker] HuggingFace login warning: {login_err}")
+                        
+                        self.sam_processor = Sam3Processor.from_pretrained(
+                            sam_info["id"], 
+                            token=self.HF_TOKEN if self.HF_TOKEN else None
+                        )
+                        self.sam_model = Sam3Model.from_pretrained(
+                            sam_info["id"], 
+                            token=self.HF_TOKEN if self.HF_TOKEN else None
+                        ).to(self.device)
+                        self.sam_model.eval()
+                        self.sam3_use_hf = True  # Flag to use HF API
+                        
+                        self.models_loaded = True
+                        print(f"[Tracker] SAM3 (HuggingFace) loaded!")
+                        return True
+                        
+                    except ImportError as hf_err:
+                        print(f"[Tracker] SAM3 not available in transformers either: {hf_err}")
+                        print("[Tracker] Please install SAM3:")
+                        print("  pip install 'git+https://github.com/facebookresearch/sam3.git'")
+                        return False
             
-        except ImportError as e:
-            print(f"[Tracker] SAM3 not available in transformers: {e}")
-            print("[Tracker] Try: pip install transformers>=4.40.0")
-            return False
         except Exception as e:
             print(f"[Tracker] SAM3 load failed: {e}")
             import traceback
@@ -941,7 +966,10 @@ class HybridSAMTracker:
     def detect_with_sam3(self, frame: np.ndarray, text_prompt: str) -> List[DetectedObject]:
         """
         SAM3 text-based detection - segments ALL instances of the concept!
-        Much simpler than SAM2: just pass text, get masks.
+        Uses native sam3 package API:
+          inference_state = processor.set_image(image)
+          output = processor.set_text_prompt(state=inference_state, prompt=text)
+          masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
         """
         if not self.models_loaded or not self.is_sam3:
             return []
@@ -949,55 +977,131 @@ class HybridSAMTracker:
         try:
             pil_image = Image.fromarray(frame)
             h, w = frame.shape[:2]
-            
-            # SAM3 takes text prompt directly
-            inputs = self.sam_processor(
-                images=pil_image, 
-                text=text_prompt, 
-                return_tensors="pt"
-            ).to(self.device)
-            
-            outputs = self.sam_model(**inputs)
-            
-            # Post-process to get instance masks
-            results = self.sam_processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.5,
-                mask_threshold=0.5,
-                target_sizes=[(h, w)]
-            )[0]
-            
             detections = []
-            masks = results.get("masks", [])
-            boxes = results.get("boxes", [])
-            scores = results.get("scores", [])
             
-            for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
-                if score < 0.3:  # Skip low confidence
-                    continue
+            # Check if using native sam3 or HuggingFace fallback
+            if hasattr(self, 'sam3_use_hf') and self.sam3_use_hf:
+                # HuggingFace transformers API fallback
+                inputs = self.sam_processor(
+                    images=pil_image, 
+                    text=text_prompt, 
+                    return_tensors="pt"
+                ).to(self.device)
                 
-                # Convert box to integers
-                if hasattr(box, 'cpu'):
-                    box = box.cpu().numpy()
-                x1, y1, x2, y2 = map(int, box)
+                outputs = self.sam_model(**inputs)
+                
+                results = self.sam_processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=0.5,
+                    mask_threshold=0.5,
+                    target_sizes=[(h, w)]
+                )[0]
+                
+                masks = results.get("masks", [])
+                boxes = results.get("boxes", [])
+                scores = results.get("scores", [])
+            else:
+                # Native sam3 package API (correct approach!)
+                # Step 1: Set the image
+                inference_state = self.sam_processor.set_image(pil_image)
+                
+                # Step 2: Set text prompt and get results
+                output = self.sam_processor.set_text_prompt(
+                    state=inference_state, 
+                    prompt=text_prompt
+                )
+                
+                masks = output.get("masks", [])
+                boxes = output.get("boxes", [])
+                scores = output.get("scores", [])
+            
+            # Process results
+            if masks is None or len(masks) == 0:
+                print(f"[SAM3] No objects found for '{text_prompt}'")
+                return []
+            
+            # Handle tensor outputs
+            if hasattr(masks, 'cpu'):
+                masks = masks.cpu().numpy()
+            if hasattr(boxes, 'cpu'):
+                boxes = boxes.cpu().numpy()
+            if hasattr(scores, 'cpu'):
+                scores = scores.cpu().numpy()
+            
+            # Ensure we have lists
+            if not isinstance(masks, (list, np.ndarray)):
+                masks = [masks]
+            if not isinstance(boxes, (list, np.ndarray)):
+                boxes = [boxes] if boxes is not None else []
+            if not isinstance(scores, (list, np.ndarray)):
+                scores = [scores] if scores is not None else [0.9] * len(masks)
+            
+            for i in range(len(masks)):
+                mask = masks[i]
+                score = scores[i] if i < len(scores) else 0.9
+                
+                # Skip low confidence
+                if score < 0.3:
+                    continue
                 
                 # Convert mask to numpy
                 if hasattr(mask, 'cpu'):
                     mask_np = mask.cpu().numpy()
+                elif hasattr(mask, 'numpy'):
+                    mask_np = mask.numpy()
                 else:
                     mask_np = np.array(mask)
+                
+                # Ensure mask is 2D
+                while len(mask_np.shape) > 2:
+                    mask_np = mask_np[0]
+                
+                # Resize mask if needed
+                if mask_np.shape != (h, w):
+                    mask_resized = cv2.resize(
+                        mask_np.astype(np.float32), 
+                        (w, h), 
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                    mask_np = mask_resized > 0.5
+                else:
+                    mask_np = mask_np > 0.5
+                
+                # Get bounding box from mask or from boxes
+                if i < len(boxes) and boxes[i] is not None:
+                    box = boxes[i]
+                    if hasattr(box, 'cpu'):
+                        box = box.cpu().numpy()
+                    if len(box) >= 4:
+                        x1, y1, x2, y2 = map(int, box[:4])
+                    else:
+                        # Compute bbox from mask
+                        ys, xs = np.where(mask_np)
+                        if len(xs) > 0:
+                            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                        else:
+                            continue
+                else:
+                    # Compute bbox from mask
+                    ys, xs = np.where(mask_np)
+                    if len(xs) > 0:
+                        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                    else:
+                        continue
                 
                 det = DetectedObject(
                     instance_id=i + 1,
                     class_name=text_prompt[:30],
                     bbox=(x1, y1, x2, y2),
-                    mask=mask_np > 0.5,
+                    mask=mask_np,
                     confidence=float(score)
                 )
                 detections.append(det)
             
             if detections:
                 print(f"[SAM3] Found {len(detections)} '{text_prompt}' instance(s)")
+            else:
+                print(f"[SAM3] No valid detections for '{text_prompt}'")
             
             return detections
             

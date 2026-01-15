@@ -110,16 +110,20 @@ source ~/.bashrc
 
 Note: If you provide an API key in the UI, it will override the environment variable for that session.
 
-### 6. HuggingFace Token for SAM3 (Optional)
+### 6. Install SAM3 (Optional)
 
-SAM3 is a gated model on HuggingFace. To use SAM3:
+SAM3 uses Meta's native package for text-based segmentation:
 
-1. Create a HuggingFace account at https://huggingface.co
-2. Accept the SAM3 model license at https://huggingface.co/facebook/sam3
-3. Create an access token at https://huggingface.co/settings/tokens
-4. Set the token: `export HF_TOKEN="your-huggingface-token"`
+```bash
+pip install 'git+https://github.com/facebookresearch/sam3.git'
+```
 
-Note: SAM2 and SAM1 models work without a HuggingFace token.
+SAM3 features:
+- Direct text prompts ("phone", "all red objects")
+- Semantic understanding of concepts
+- Automatic multi-instance detection
+
+Note: SAM2 works without SAM3 installed.
 
 ### 7. Download SAM Models (Optional)
 
@@ -299,6 +303,7 @@ MIT License
 ## Acknowledgments
 
 - [Google Gemini](https://deepmind.google/technologies/gemini/) for the Live API
-- [Meta AI](https://segment-anything.com/) for SAM and SAM2
+- [Meta AI](https://segment-anything.com/) for SAM, SAM2, and SAM3
 - [IDEA Research](https://github.com/IDEA-Research/Grounding-DINO) for Grounding DINO
 - [Gradio](https://gradio.app/) for the web interface framework
+- [HuggingFace](https://huggingface.co/) for model hosting and transformers library

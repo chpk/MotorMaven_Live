@@ -41,6 +41,13 @@ gradio>=4.0.0
 # HuggingFace Transformers (includes Grounding DINO + SAM2)
 transformers>=4.40.0
 
+# ============================================
+# SAM3 (Optional - for text-based segmentation)
+# ============================================
+# SAM3 uses native Meta package, install separately:
+#   pip install 'git+https://github.com/facebookresearch/sam3.git'
+# SAM3 understands natural language and semantic relations!
+
 # Model loading acceleration
 accelerate>=0.27.0
 
