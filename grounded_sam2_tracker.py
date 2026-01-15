@@ -57,9 +57,10 @@ class DetectedObject:
 @dataclass
 class GeminiDetection:
     """Detection result from Gemini with description and bbox."""
-    description: str  # Specific visual description
+    description: str  # Specific visual description (for SAM3: make it descriptive!)
     bbox: Optional[Tuple[float, float, float, float]] = None  # Normalized 0-1: x1, y1, x2, y2
     confidence: float = 0.8
+    object_type: str = "generic"  # "generic" or "custom" - custom objects need box prompts
 
 
 class PreciseGeminiExtractor:
@@ -496,7 +497,16 @@ class HybridSAMTracker:
         self.current_gemini_detections: List[GeminiDetection] = []
         self.prompt_lock = threading.Lock()
         self.models_loaded = False
-        self.sam3_use_hf = False  # Flag for HuggingFace SAM3 fallback
+        
+        # SAM3 Video Tracker State
+        self.sam3_video_model = None
+        self.sam3_predictor = None
+        self.sam3_inference_state = None
+        self.sam3_tracked_objects = {}  # obj_id -> description
+        self.sam3_next_obj_id = 1
+        self.sam3_frame_width = 0
+        self.sam3_frame_height = 0
+        self.sam3_temp_dir = None
         
         # Detection settings
         self.detection_threshold = 0.15
@@ -517,6 +527,20 @@ class HybridSAMTracker:
         self.extraction_queue = queue.Queue(maxsize=2)
         self.extraction_thread = None
         self._running = False
+    
+    def __del__(self):
+        """Cleanup resources."""
+        self._cleanup_sam3_temp_dir()
+    
+    def _cleanup_sam3_temp_dir(self):
+        """Remove SAM3 temporary video directory."""
+        try:
+            if self.sam3_temp_dir and os.path.exists(self.sam3_temp_dir):
+                import shutil
+                shutil.rmtree(self.sam3_temp_dir)
+                self.sam3_temp_dir = None
+        except Exception:
+            pass  # Silently ignore cleanup errors during shutdown
     
     @classmethod
     def get_available_models(cls) -> List[Dict]:
@@ -572,69 +596,37 @@ class HybridSAMTracker:
             return False
     
     def _load_sam3_models(self, sam_info: dict) -> bool:
-        """Load SAM3 model - text-based segmentation (no DINO needed!)."""
+        """Load SAM3 VIDEO PREDICTOR for real-time tracking with TEXT prompts."""
         import warnings
         
-        print(f"[Tracker] Loading SAM3 ({sam_info['params']}) - Text-based segmentation!")
-        print("[Tracker] SAM3 understands natural language directly - no Grounding DINO needed")
+        print(f"[Tracker] Loading SAM3 VIDEO PREDICTOR ({sam_info['params']})")
+        print("[Tracker] SAM3 supports: TEXT PROMPTS, point prompts, box prompts")
         
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore")
                 
-                # SAM3 uses native sam3 package, NOT HuggingFace transformers
-                # Install via: pip install 'git+https://github.com/facebookresearch/sam3.git'
-                try:
-                    from sam3.model_builder import build_sam3_image_model
-                    from sam3.model.sam3_image_processor import Sam3Processor
-                    
-                    print("[Tracker] Building SAM3 image model...")
-                    self.sam_model = build_sam3_image_model()
-                    self.sam_processor = Sam3Processor(self.sam_model)
-                    
-                    self.models_loaded = True
-                    print(f"[Tracker] SAM3 loaded! Use text prompts like 'phone', 'all red objects', etc.")
-                    return True
-                    
-                except ImportError as e:
-                    print(f"[Tracker] sam3 package not installed: {e}")
-                    print("[Tracker] Install SAM3: pip install 'git+https://github.com/facebookresearch/sam3.git'")
-                    
-                    # Fallback: try HuggingFace transformers (if available)
-                    print("[Tracker] Trying HuggingFace transformers fallback...")
-                    try:
-                        from transformers import Sam3Processor, Sam3Model
-                        
-                        # Login to HuggingFace for gated model access
-                        if self.HF_TOKEN:
-                            try:
-                                from huggingface_hub import login
-                                login(token=self.HF_TOKEN, add_to_git_credential=False)
-                                print("[Tracker] HuggingFace login successful")
-                            except Exception as login_err:
-                                print(f"[Tracker] HuggingFace login warning: {login_err}")
-                        
-                        self.sam_processor = Sam3Processor.from_pretrained(
-                            sam_info["id"], 
-                            token=self.HF_TOKEN if self.HF_TOKEN else None
-                        )
-                        self.sam_model = Sam3Model.from_pretrained(
-                            sam_info["id"], 
-                            token=self.HF_TOKEN if self.HF_TOKEN else None
-                        ).to(self.device)
-                        self.sam_model.eval()
-                        self.sam3_use_hf = True  # Flag to use HF API
-                        
-                        self.models_loaded = True
-                        print(f"[Tracker] SAM3 (HuggingFace) loaded!")
-                        return True
-                        
-                    except ImportError as hf_err:
-                        print(f"[Tracker] SAM3 not available in transformers either: {hf_err}")
-                        print("[Tracker] Please install SAM3:")
-                        print("  pip install 'git+https://github.com/facebookresearch/sam3.git'")
-                        return False
-            
+                from sam3.model_builder import build_sam3_video_predictor
+                
+                print("[Tracker] Building SAM3 video predictor (this may take a moment)...")
+                self.sam3_predictor = build_sam3_video_predictor(gpus_to_use=[0])
+                
+                # Session management for real-time streaming
+                self.sam3_session_id = None
+                self.sam3_session_frame_dir = None
+                self.sam3_current_prompts = {}  # obj_id -> description
+                self.sam3_next_obj_id = 1
+                self.sam3_last_masks = {}  # obj_id -> mask
+                
+                self.models_loaded = True
+                print("[Tracker] SAM3 VIDEO PREDICTOR loaded!")
+                print("[Tracker] Use descriptive TEXT prompts: 'black phone', 'red box', 'white motor with grills'")
+                return True
+                
+        except ImportError as e:
+            print(f"[Tracker] SAM3 not installed: {e}")
+            print("[Tracker] Install: cd sam3 && pip install -e .")
+            return False
         except Exception as e:
             print(f"[Tracker] SAM3 load failed: {e}")
             import traceback
@@ -972,154 +964,243 @@ class HybridSAMTracker:
             print(f"[Tracker] SAM error: {e}")
             return detections
     
+    def _init_sam3_session(self, frames: List[np.ndarray]):
+        """Initialize SAM3 video session for tracking."""
+        import tempfile
+        import uuid
+        
+        # Close any existing session
+        if self.sam3_session_id:
+            try:
+                self.sam3_predictor.close_session(self.sam3_session_id)
+            except:
+                pass
+        
+        # Cleanup old frame directory
+        self._cleanup_sam3_temp_dir()
+        
+        # Create new frame directory
+        self.sam3_temp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+        
+        # Save frames to directory
+        for i, frame in enumerate(frames):
+            frame_path = os.path.join(self.sam3_temp_dir, f"{i:05d}.jpg")
+            cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        
+        # Start session with frame directory
+        session_result = self.sam3_predictor.start_session(
+            resource_path=self.sam3_temp_dir
+        )
+        
+        # Extract session_id from result (may be dict or string)
+        if isinstance(session_result, dict):
+            self.sam3_session_id = session_result.get('session_id', session_result)
+        else:
+            self.sam3_session_id = session_result
+        
+        # Clear tracked objects
+        self.sam3_current_prompts = {}
+        self.sam3_next_obj_id = 1
+        self.sam3_last_masks = {}
+        
+        print(f"[SAM3] Session started: {self.sam3_session_id}")
+        return self.sam3_session_id
+    
+    def _add_sam3_text_prompt(self, description: str, frame_idx: int = 0) -> Optional[dict]:
+        """Add object to SAM3 using TEXT prompt - returns immediate detection result!"""
+        if not self.sam3_session_id:
+            return None
+        
+        try:
+            obj_id = self.sam3_next_obj_id
+            self.sam3_next_obj_id += 1
+            
+            # Use SAM3 text prompt API - returns immediate segmentation!
+            response = self.sam3_predictor.add_prompt(
+                session_id=self.sam3_session_id,
+                frame_idx=frame_idx,
+                text=description,  # THE TEXT PROMPT!
+                obj_id=obj_id
+            )
+            
+            if response:
+                self.sam3_current_prompts[obj_id] = description
+                print(f"[SAM3] Text prompt: '{description}' (ID={obj_id})")
+                return {
+                    'obj_id': obj_id,
+                    'description': description,
+                    'response': response
+                }
+            
+            return None
+            
+        except Exception as e:
+            print(f"[SAM3] Text prompt error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _add_sam3_box_prompt(self, description: str, bbox: Tuple[float, float, float, float], 
+                             frame_idx: int = 0) -> Optional[dict]:
+        """Add object using bounding box prompt (for custom objects) - returns immediate result!"""
+        if not self.sam3_session_id:
+            return None
+        
+        try:
+            obj_id = self.sam3_next_obj_id
+            self.sam3_next_obj_id += 1
+            
+            # Convert bbox (normalized 0-1) to list format
+            x1, y1, x2, y2 = bbox
+            boxes = [[x1, y1, x2, y2]]
+            box_labels = [1]  # Positive box
+            
+            response = self.sam3_predictor.add_prompt(
+                session_id=self.sam3_session_id,
+                frame_idx=frame_idx,
+                bounding_boxes=boxes,
+                bounding_box_labels=box_labels,
+                obj_id=obj_id
+            )
+            
+            if response:
+                self.sam3_current_prompts[obj_id] = description
+                print(f"[SAM3] Box prompt: '{description}' (ID={obj_id})")
+                return {
+                    'obj_id': obj_id,
+                    'description': description,
+                    'response': response
+                }
+            
+            return None
+            
+        except Exception as e:
+            print(f"[SAM3] Box prompt error: {e}")
+            return None
+    
     @torch.inference_mode()
-    def detect_with_sam3(self, frame: np.ndarray, text_prompt: str) -> List[DetectedObject]:
+    def detect_with_sam3_video(self, frame: np.ndarray, objects: List[GeminiDetection]) -> List[DetectedObject]:
         """
-        SAM3 text-based detection - segments ALL instances of the concept!
-        Uses native sam3 package API:
-          inference_state = processor.set_image(image)
-          output = processor.set_text_prompt(state=inference_state, prompt=text)
-          masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
+        SAM3 VIDEO detection using TEXT PROMPTS!
+        
+        SAM3 understands natural language and returns immediate segmentation:
+        - "black phone case"
+        - "white motor with cooling grills" 
+        - "red warning label"
+        - "ABB logo"
+        - "green circuit board"
+        
+        Each text prompt returns a segmentation mask directly.
         """
         if not self.models_loaded or not self.is_sam3:
             return []
         
+        if not objects:
+            return []
+        
         try:
-            pil_image = Image.fromarray(frame)
             h, w = frame.shape[:2]
+            
+            # Initialize session with current frame
+            self._init_sam3_session([frame])
+            
             detections = []
             
-            # Check if using native sam3 or HuggingFace fallback
-            if hasattr(self, 'sam3_use_hf') and self.sam3_use_hf:
-                # HuggingFace transformers API fallback
-                inputs = self.sam_processor(
-                    images=pil_image, 
-                    text=text_prompt, 
-                    return_tensors="pt"
-                ).to(self.device)
+            # Process each object with SAM3 text prompts
+            for obj in objects:
+                desc = obj.description.strip()
                 
-                outputs = self.sam_model(**inputs)
+                # Use TEXT prompt - returns immediate segmentation!
+                if obj.object_type == "custom" and obj.bbox:
+                    # Custom object with bbox - use box prompt
+                    result = self._add_sam3_box_prompt(desc, obj.bbox, frame_idx=0)
+                else:
+                    # Use text prompt - SAM3's main feature!
+                    result = self._add_sam3_text_prompt(desc, frame_idx=0)
                 
-                results = self.sam_processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=0.5,
-                    mask_threshold=0.5,
-                    target_sizes=[(h, w)]
-                )[0]
-                
-                masks = results.get("masks", [])
-                boxes = results.get("boxes", [])
-                scores = results.get("scores", [])
-            else:
-                # Native sam3 package API (correct approach!)
-                # Step 1: Set the image
-                inference_state = self.sam_processor.set_image(pil_image)
-                
-                # Step 2: Set text prompt and get results
-                output = self.sam_processor.set_text_prompt(
-                    state=inference_state, 
-                    prompt=text_prompt
-                )
-                
-                masks = output.get("masks", [])
-                boxes = output.get("boxes", [])
-                scores = output.get("scores", [])
-            
-            # Process results
-            if masks is None or len(masks) == 0:
-                print(f"[SAM3] No objects found for '{text_prompt}'")
-                return []
-            
-            # Handle tensor outputs
-            if hasattr(masks, 'cpu'):
-                masks = masks.cpu().numpy()
-            if hasattr(boxes, 'cpu'):
-                boxes = boxes.cpu().numpy()
-            if hasattr(scores, 'cpu'):
-                scores = scores.cpu().numpy()
-            
-            # Ensure we have lists
-            if not isinstance(masks, (list, np.ndarray)):
-                masks = [masks]
-            if not isinstance(boxes, (list, np.ndarray)):
-                boxes = [boxes] if boxes is not None else []
-            if not isinstance(scores, (list, np.ndarray)):
-                scores = [scores] if scores is not None else [0.9] * len(masks)
-            
-            for i in range(len(masks)):
-                mask = masks[i]
-                score = scores[i] if i < len(scores) else 0.9
-                
-                # Skip low confidence
-                if score < 0.3:
+                if not result or 'response' not in result:
                     continue
                 
-                # Convert mask to numpy
+                # Extract detection from immediate response
+                response = result['response']
+                obj_id = result['obj_id']
+                description = result['description']
+                
+                outputs = response.get('outputs', {})
+                masks = outputs.get('out_binary_masks', [])
+                probs = outputs.get('out_probs', [])
+                
+                if masks is None or len(masks) == 0:
+                    continue
+                
+                # Get the first (and usually only) detection
+                mask = masks[0] if len(masks) > 0 else None
+                prob = probs[0] if len(probs) > 0 else 0.9
+                
+                if mask is None:
+                    continue
+                
+                # Convert to numpy
                 if hasattr(mask, 'cpu'):
-                    mask_np = mask.cpu().numpy()
-                elif hasattr(mask, 'numpy'):
-                    mask_np = mask.numpy()
+                    mask = mask.cpu().numpy()
                 else:
-                    mask_np = np.array(mask)
+                    mask = np.array(mask)
                 
-                # Ensure mask is 2D
-                while len(mask_np.shape) > 2:
-                    mask_np = mask_np[0]
+                # Ensure 2D
+                while len(mask.shape) > 2:
+                    mask = mask[0]
                 
-                # Resize mask if needed
-                if mask_np.shape != (h, w):
-                    mask_resized = cv2.resize(
-                        mask_np.astype(np.float32), 
-                        (w, h), 
-                        interpolation=cv2.INTER_LINEAR
-                    )
-                    mask_np = mask_resized > 0.5
-                else:
-                    mask_np = mask_np > 0.5
+                mask = mask.astype(bool)
                 
-                # Get bounding box from mask or from boxes
-                if i < len(boxes) and boxes[i] is not None:
-                    box = boxes[i]
-                    if hasattr(box, 'cpu'):
-                        box = box.cpu().numpy()
-                    if len(box) >= 4:
-                        x1, y1, x2, y2 = map(int, box[:4])
-                    else:
-                        # Compute bbox from mask
-                        ys, xs = np.where(mask_np)
-                        if len(xs) > 0:
-                            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                        else:
-                            continue
-                else:
-                    # Compute bbox from mask
-                    ys, xs = np.where(mask_np)
-                    if len(xs) > 0:
-                        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                    else:
-                        continue
+                # Resize if needed
+                if mask.shape != (h, w):
+                    mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
+                
+                # Skip empty masks
+                if mask.sum() == 0:
+                    print(f"[SAM3] '{description}' - no mask found")
+                    continue
+                
+                # Get bbox from mask
+                ys, xs = np.where(mask)
+                x1, y1 = int(xs.min()), int(ys.min())
+                x2, y2 = int(xs.max()), int(ys.max())
                 
                 det = DetectedObject(
-                    instance_id=i + 1,
-                    class_name=text_prompt[:30],
+                    instance_id=obj_id,
+                    class_name=description[:30],
                     bbox=(x1, y1, x2, y2),
-                    mask=mask_np,
-                    confidence=float(score)
+                    mask=mask,
+                    confidence=float(prob)
                 )
                 detections.append(det)
+                self.sam3_last_masks[obj_id] = mask
+                print(f"[SAM3] '{description}': bbox=({x1},{y1},{x2},{y2}), conf={prob:.2f}")
             
             if detections:
-                print(f"[SAM3] Found {len(detections)} '{text_prompt}' instance(s)")
-            else:
-                print(f"[SAM3] No valid detections for '{text_prompt}'")
+                print(f"[SAM3] Total: {len(detections)} object(s) detected")
             
             return detections
             
         except Exception as e:
-            print(f"[SAM3] Detection error: {e}")
+            print(f"[SAM3] Video detection error: {e}")
             import traceback
             traceback.print_exc()
             return []
+    
+    def clear_sam3_tracking(self):
+        """Clear all SAM3 tracked objects and close session."""
+        if hasattr(self, 'sam3_predictor') and self.sam3_session_id:
+            try:
+                self.sam3_predictor.close_session(self.sam3_session_id)
+            except:
+                pass
+        self.sam3_session_id = None
+        self.sam3_current_prompts = {}
+        self.sam3_next_obj_id = 1
+        self.sam3_last_masks = {}
+        self._cleanup_sam3_temp_dir()
+        print("[SAM3] Tracking cleared")
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[DetectedObject]]:
         """
@@ -1165,34 +1246,199 @@ class HybridSAMTracker:
         annotated = self.annotate_frame(frame, detections)
         return annotated, detections
     
+    def _enhance_prompt_for_sam3(self, obj_name: str) -> str:
+        """
+        Enhance object prompt for SAM3 with descriptive attributes.
+        
+        SAM3 works best with descriptive, attribute-based prompts like:
+        - "black phone case" instead of "phone"
+        - "white motor with cooling grills" instead of "motor"
+        - "green circuit board with components" instead of "PCB"
+        - "red warning label" instead of "label"
+        """
+        # Map generic names to more descriptive prompts
+        descriptor_map = {
+            # Electronics
+            "phone": "black phone device",
+            "laptop": "gray laptop computer",
+            "monitor": "black computer monitor screen",
+            "keyboard": "gray computer keyboard",
+            "mouse": "black computer mouse",
+            "cable": "black cable wire",
+            "charger": "black charging adapter",
+            "pcb": "green circuit board with electronic components",
+            "circuit board": "green printed circuit board",
+            
+            # Industrial
+            "motor": "gray electric motor with cooling fins",
+            "pump": "metallic industrial pump",
+            "valve": "metal valve component",
+            "pipe": "metal pipe tubing",
+            "conveyor": "industrial conveyor belt system",
+            "sensor": "small electronic sensor module",
+            "button": "colored control button",
+            "switch": "electrical switch toggle",
+            "gauge": "circular gauge meter display",
+            
+            # Tools/Objects
+            "tool": "metal hand tool",
+            "box": "cardboard box container",
+            "bottle": "plastic bottle container",
+            "cup": "drinking cup or mug",
+            "pen": "writing pen or pencil",
+            "book": "rectangular book or document",
+            "paper": "white paper sheet",
+            "label": "printed label sticker",
+            
+            # Furniture
+            "table": "flat surface table",
+            "chair": "seating chair",
+            "shelf": "storage shelf rack",
+            "cabinet": "storage cabinet unit",
+            
+            # Safety
+            "sign": "warning or information sign",
+            "light": "illuminated light fixture",
+            "warning": "yellow warning sign",
+            "logo": "company logo branding",
+        }
+        
+        obj_lower = obj_name.lower().strip()
+        words = obj_lower.split()
+        
+        # Color/attribute words to preserve
+        color_words = ["red", "blue", "green", "black", "white", "gray", "grey", 
+                       "yellow", "orange", "brown", "silver", "metallic", "shiny"]
+        attribute_words = ["large", "small", "big", "tall", "round", "square", 
+                          "left", "right", "top", "bottom", "front", "back"]
+        
+        # Extract user-specified attributes
+        user_color = None
+        user_attr = None
+        base_obj = []
+        
+        for word in words:
+            if word in color_words:
+                user_color = word
+            elif word in attribute_words:
+                user_attr = word
+            else:
+                base_obj.append(word)
+        
+        base_obj_str = " ".join(base_obj)
+        
+        # If user specified color/attribute, use it with enhanced base
+        if user_color or user_attr or len(words) > 1:
+            # Already descriptive - enhance base object only
+            if base_obj_str in descriptor_map:
+                enhanced_base = descriptor_map[base_obj_str]
+                # Replace default color with user color if specified
+                if user_color:
+                    # Remove default color from enhanced
+                    for c in color_words:
+                        enhanced_base = enhanced_base.replace(c + " ", "")
+                    return f"{user_color} {enhanced_base}".strip()
+                return f"{user_attr} {enhanced_base}".strip() if user_attr else enhanced_base
+            return obj_name  # Already descriptive enough
+        
+        # Check for exact match on single word
+        if obj_lower in descriptor_map:
+            return descriptor_map[obj_lower]
+        
+        # Check for partial match
+        for key, desc in descriptor_map.items():
+            if key in obj_lower or obj_lower in key:
+                return desc
+        
+        # Default: add generic descriptor
+        return f"{obj_name} object"
+    
+    def _interpret_custom_object(self, obj_name: str, frame: np.ndarray = None) -> str:
+        """
+        Interpret custom/unseen object and generate descriptive prompt.
+        
+        For unfamiliar objects, transform the name into a visual description:
+        - "PCB" -> "green circuit board with electronic components"
+        - "ABB motor" -> "gray industrial motor with ABB logo"
+        - "T1 text" -> "text label showing T1"
+        """
+        obj_lower = obj_name.lower().strip()
+        
+        # Special interpretations for common industrial/technical terms
+        interpretations = {
+            "abb": "ABB branded industrial equipment",
+            "siemens": "Siemens branded equipment",
+            "allen bradley": "Allen Bradley control equipment",
+            "rockwell": "Rockwell automation equipment",
+            "plc": "programmable logic controller box",
+            "hmi": "human machine interface touchscreen",
+            "vfd": "variable frequency drive unit",
+            "relay": "electrical relay module",
+            "contactor": "electrical contactor switch",
+            "terminal": "electrical terminal block",
+            "fuse": "electrical fuse component",
+            "breaker": "circuit breaker switch",
+            "transformer": "electrical transformer unit",
+        }
+        
+        # Check for brand/technical terms
+        for term, interpretation in interpretations.items():
+            if term in obj_lower:
+                return interpretation
+        
+        # Pattern: "XX text" or "XX label" -> interpret as text/label
+        if "text" in obj_lower or "label" in obj_lower:
+            parts = obj_lower.replace("text", "").replace("label", "").strip()
+            if parts:
+                return f"text or label showing {parts}"
+        
+        # Pattern: "XX logo" -> interpret as logo
+        if "logo" in obj_lower:
+            parts = obj_lower.replace("logo", "").strip()
+            if parts:
+                return f"{parts} company logo branding"
+        
+        return self._enhance_prompt_for_sam3(obj_name)
+    
     def _process_frame_sam3(self, frame: np.ndarray, prompt: str) -> List[DetectedObject]:
         """
-        Process frame using SAM3 text-based segmentation.
+        Process frame using SAM3 VIDEO TRACKER with descriptive prompts.
         
-        SAM3 Strategy:
+        SAM3 Video Strategy:
         1. Get objects from Gemini detections (extracted from user speech)
-        2. For generic objects: use SAM3 text prompt directly
-        3. For custom/unseen objects: use SAM3 text prompt + Gemini bbox hint
+        2. Enhance prompts with descriptive attributes
+        3. For generic objects: add via point prompt at expected location
+        4. For custom/unseen objects: interpret and use box prompt
+        5. Track all objects across frames using SAM3 video propagation
         """
-        all_detections = []
         h, w = frame.shape[:2]
         
         # Get Gemini-extracted objects
         with self.prompt_lock:
             gemini_dets = list(self.current_gemini_detections)
         
+        # Prepare object list for SAM3 video tracking
+        objects_to_track = []
+        
         # If no Gemini detections, parse the prompt directly
         if not gemini_dets and prompt:
             # Parse "phone. wallet." style prompt
-            objects = [obj.strip() for obj in prompt.replace(".", " ").split() if obj.strip()]
-            objects = list(set(objects))[:5]
+            parsed_objects = [obj.strip() for obj in prompt.replace(".", " ").split() if obj.strip()]
+            parsed_objects = list(set(parsed_objects))[:5]
             
-            for obj_name in objects:
+            for obj_name in parsed_objects:
                 if len(obj_name) < 2:
                     continue
-                # Use SAM3 directly with text prompt
-                detections = self.detect_with_sam3(frame, obj_name)
-                all_detections.extend(detections)
+                
+                # Enhance with descriptive prompt
+                enhanced_desc = self._enhance_prompt_for_sam3(obj_name)
+                
+                objects_to_track.append(GeminiDetection(
+                    description=enhanced_desc,
+                    confidence=0.8,
+                    object_type="generic",
+                    bbox=None
+                ))
         else:
             # Use Gemini-extracted objects
             seen_objects = set()
@@ -1205,43 +1451,26 @@ class HybridSAMTracker:
                     continue
                 seen_objects.add(obj_name)
                 
-                # Try SAM3 with text prompt first
-                detections = self.detect_with_sam3(frame, obj_name)
+                # Check if it's a custom/unseen object
+                is_custom = gd.object_type == "custom" or not self._is_generic_object(obj_name)
                 
-                if detections:
-                    all_detections.extend(detections)
-                    print(f"[SAM3] '{obj_name}' detected via text prompt")
-                elif gd.bbox and gd.object_type == "custom":
-                    # For custom/unseen objects, use Gemini bbox as fallback
-                    # Convert normalized bbox to pixels
-                    x1 = int(gd.bbox[0] * w)
-                    y1 = int(gd.bbox[1] * h)
-                    x2 = int(gd.bbox[2] * w)
-                    y2 = int(gd.bbox[3] * h)
-                    
-                    # Validate bbox
-                    x1 = max(0, min(w - 20, x1))
-                    y1 = max(0, min(h - 20, y1))
-                    x2 = max(x1 + 20, min(w, x2))
-                    y2 = max(y1 + 20, min(h, y2))
-                    
-                    # Create simple rectangular mask
-                    mask = np.zeros((h, w), dtype=bool)
-                    mask[y1:y2, x1:x2] = True
-                    
-                    det = DetectedObject(
-                        instance_id=len(all_detections) + 1,
-                        class_name=obj_name[:30],
-                        bbox=(x1, y1, x2, y2),
-                        mask=mask,
-                        confidence=gd.confidence
-                    )
-                    all_detections.append(det)
-                    print(f"[SAM3] '{obj_name}' fallback to Gemini bbox (custom object)")
+                if is_custom:
+                    # Interpret custom object for better SAM3 understanding
+                    enhanced_desc = self._interpret_custom_object(obj_name, frame)
+                    print(f"[SAM3] Custom object '{obj_name}' -> '{enhanced_desc}'")
                 else:
-                    print(f"[SAM3] '{obj_name}' not found")
+                    # Enhance generic object description
+                    enhanced_desc = self._enhance_prompt_for_sam3(obj_name)
+                
+                objects_to_track.append(GeminiDetection(
+                    description=enhanced_desc,
+                    confidence=gd.confidence,
+                    object_type=gd.object_type,
+                    bbox=gd.bbox
+                ))
         
-        return all_detections
+        # Use SAM3 video tracking
+        return self.detect_with_sam3_video(frame, objects_to_track)
     
     def _process_frame_sam2(self, frame: np.ndarray, prompt: str) -> List[DetectedObject]:
         """Process frame using DINO + SAM2 (visual prompts)."""
