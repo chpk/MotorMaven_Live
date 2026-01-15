@@ -72,6 +72,16 @@ pip install -r requirements.txt
 
 Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
+You have two options to provide the API key:
+
+**Option A: Via Web UI (Recommended for quick testing)**
+1. Launch the application: `python app_gradio.py`
+2. Open http://localhost:7860
+3. Expand the "Settings" accordion
+4. Enter your API key in the "Gemini API Key" field
+5. Click "Start Call"
+
+**Option B: Via Environment Variable (Recommended for regular use)**
 ```bash
 # Linux/macOS
 export GEMINI_API_KEY="your-api-key-here"
@@ -80,6 +90,8 @@ export GEMINI_API_KEY="your-api-key-here"
 echo 'export GEMINI_API_KEY="your-api-key-here"' >> ~/.bashrc
 source ~/.bashrc
 ```
+
+Note: If you provide an API key in the UI, it will override the environment variable for that session.
 
 ### 6. Download SAM Models (Optional)
 

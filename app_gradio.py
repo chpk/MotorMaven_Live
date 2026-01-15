@@ -382,7 +382,9 @@ class ImprovedVAD:
 
 class GeminiLiveSession:
     def __init__(self):
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        # API key - can be set via UI or environment variable
+        self.api_key = GEMINI_API_KEY
+        self.client = None  # Will be initialized when starting
         
         # Audio
         self.pya = None
@@ -481,13 +483,22 @@ class GeminiLiveSession:
     def get_transcript(self):
         return "\n".join(self.transcript[-20:])
     
-    def set_devices(self, mic, speaker, camera, voice, sam_enabled, sam_model="sam2-hiera-small"):
+    def set_devices(self, mic, speaker, camera, voice, sam_enabled, sam_model="sam2-hiera-small", api_key=""):
         self.mic_idx = mic
         self.speaker_idx = speaker
         self.camera_idx = camera
         self.voice = voice
         self.sam_enabled = sam_enabled and SAM_AVAILABLE
         self.sam_model = sam_model
+        # Use UI-provided API key if available, otherwise fall back to environment variable
+        if api_key and api_key.strip():
+            self.api_key = api_key.strip()
+            self.log("Using API key from UI", "info")
+        elif GEMINI_API_KEY:
+            self.api_key = GEMINI_API_KEY
+            self.log("Using API key from environment variable", "info")
+        else:
+            self.api_key = ""
     
     def _init_audio(self):
         try:
@@ -946,6 +957,19 @@ class GeminiLiveSession:
         if self.is_running:
             return "Already running"
         
+        # Check for API key
+        if not self.api_key:
+            self.log("ERROR: No API key provided!", "error")
+            return "Error: No API key. Enter key in Settings or set GEMINI_API_KEY environment variable."
+        
+        # Initialize Gemini client with the API key
+        try:
+            self.client = genai.Client(api_key=self.api_key)
+            self.log("Gemini client initialized", "success")
+        except Exception as e:
+            self.log(f"Failed to initialize client: {e}", "error")
+            return f"Error: Failed to initialize Gemini client: {e}"
+        
         self.is_running = True
         self.transcript.clear()
         self.response_text = ""
@@ -1138,6 +1162,17 @@ def create_ui():
         # SETTINGS - Collapsible accordion (minimized by default)
         # =====================================================================
         with gr.Accordion("Settings", open=False, elem_classes=["settings-accordion"]):
+            # API Key row
+            with gr.Row():
+                api_key_status = "Set via environment" if GEMINI_API_KEY else "Not set"
+                api_key = gr.Textbox(
+                    label="Gemini API Key",
+                    placeholder="Enter your Gemini API key (or set GEMINI_API_KEY env var)",
+                    type="password",
+                    scale=3,
+                    info=f"Status: {api_key_status}. Get your key from https://aistudio.google.com/apikey"
+                )
+            
             with gr.Row():
                 mic = gr.Dropdown(
                     choices=mic_choices,
@@ -1218,8 +1253,8 @@ def create_ui():
         # EVENT HANDLERS
         # =====================================================================
         
-        def on_start(m, s, c, v, sam, sam_m):
-            session.set_devices(m, s, c, v, sam, sam_m)
+        def on_start(m, s, c, v, sam, sam_m, key):
+            session.set_devices(m, s, c, v, sam, sam_m, key)
             return session.start()
         
         def on_stop():
@@ -1247,7 +1282,7 @@ def create_ui():
             return st, current_logs or "", tr or "", frame, prompt
         
         # Button clicks
-        start_btn.click(on_start, [mic, speaker, camera, voice, sam_cb, sam_model], [])
+        start_btn.click(on_start, [mic, speaker, camera, voice, sam_cb, sam_model, api_key], [])
         stop_btn.click(on_stop, [], [])
         sam_prompt_box.change(on_prompt_change, [sam_prompt_box], [])
         
