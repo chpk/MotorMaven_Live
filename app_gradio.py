@@ -545,7 +545,7 @@ class GeminiLiveSession:
         try:
             self.log(f"Loading SAM: {self.sam_model}...", "sam")
             self.sam_tracker = GroundedSAMTracker(
-                api_key=GEMINI_API_KEY,
+                api_key=self.api_key,  # Use the API key from UI or env var
                 sam_model=self.sam_model
             )
             
@@ -656,15 +656,20 @@ class GeminiLiveSession:
                             loop
                         )
                     
-                    # When user finishes speaking, use a generic request to analyze the frame
-                    # The actual object extraction will happen when Gemini responds
+                    # When user finishes speaking, trigger extraction
+                    # This is a preliminary detection - AI response will refine it
                     if speech_ended and self.sam_enabled and self.sam_tracker:
                         with self.frame_lock:
                             frame = self.display_frame.copy() if self.display_frame is not None else None
                         if frame is not None:
-                            # Use a generic prompt - Gemini will see the frame and describe what's visible
-                            # that the user might be asking about
-                            self.sam_tracker.extract_keywords_async(frame, "What object is the user pointing at or asking about? Identify the main objects visible.")
+                            # Initial detection - look for prominent objects
+                            print("[SAM] Speech ended - triggering object detection...")
+                            self.sam_tracker.extract_keywords_async(
+                                frame, 
+                                "Identify ALL prominent objects visible in this frame that the user might be asking about. Include any items being held, pointed at, or in focus."
+                            )
+                        else:
+                            print("[SAM] No frame available for extraction")
                     
                 except Exception as e:
                     time.sleep(0.01)
@@ -870,8 +875,17 @@ class GeminiLiveSession:
                     with self.frame_lock:
                         frame = self.display_frame.copy() if self.display_frame is not None else None
                     if frame is not None:
-                        # Use Gemini's response to understand what objects were discussed
-                        self.sam_tracker.extract_keywords_async(frame, f"Based on this conversation: '{turn_text[:200]}' - identify the objects being discussed.")
+                        # Parse what objects the user asked about from AI's response
+                        # AI usually describes or refers to the objects mentioned
+                        extraction_prompt = f"""The user asked and AI responded: "{turn_text[:300]}"
+
+Based on this conversation, identify ALL objects that should be highlighted/segmented.
+- If user asked "what is this" - identify the main object
+- If user asked "highlight X and Y" - include BOTH objects
+- If discussing specific items - include all mentioned items
+- Look for objects actually visible in the current frame"""
+                        print(f"[SAM] Extracting from AI response: {turn_text[:100]}...")
+                        self.sam_tracker.extract_keywords_async(frame, extraction_prompt)
                 
             except asyncio.CancelledError:
                 break
@@ -1282,8 +1296,8 @@ def create_ui():
             return st, current_logs or "", tr or "", frame, prompt
         
         # Button clicks
-        start_btn.click(on_start, [mic, speaker, camera, voice, sam_cb, sam_model, api_key], [])
-        stop_btn.click(on_stop, [], [])
+        start_btn.click(on_start, [mic, speaker, camera, voice, sam_cb, sam_model, api_key], [status])
+        stop_btn.click(on_stop, [], [status])
         sam_prompt_box.change(on_prompt_change, [sam_prompt_box], [])
         
         # Timer for UI updates

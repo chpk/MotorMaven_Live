@@ -67,35 +67,32 @@ class PreciseGeminiExtractor:
     Works for both common objects AND custom/industrial objects.
     """
     
-    SYSTEM_PROMPT = """You are an object detector. Identify objects and provide ACCURATE bounding boxes.
+    SYSTEM_PROMPT = """You are a precise object detector. Identify ALL objects mentioned by the user.
 
-TASK: Look at the image and identify the object(s) the user mentions.
+TASK: Look at the image and find EVERY object the user is asking about.
 
 OUTPUT FORMAT (JSON only):
 {"objects":[
-  {"description":"object_name", "bbox":[x1, y1, x2, y2]},
-  {"description":"object_name", "bbox":[x1, y1, x2, y2]}
+  {"description":"simple_name", "bbox":[x1, y1, x2, y2]},
+  {"description":"simple_name", "bbox":[x1, y1, x2, y2]}
 ]}
 
-BBOX COORDINATES (CRITICAL - be precise):
-- Normalized 0.0 to 1.0
-- [left, top, right, bottom]
-- Be ACCURATE - trace the actual object boundaries
+CRITICAL RULES:
+1. Include ALL objects the user mentions - if they say "phone and wallet", include BOTH
+2. Use simple 1-2 word descriptions: "phone", "wallet", "red mug", "motor", "terminal"
+3. BBOX must be accurate normalized coordinates [0.0-1.0]: [left, top, right, bottom]
 
-EXAMPLES:
-- Object on left side: bbox=[0.05, 0.2, 0.4, 0.8]
-- Object on right side: bbox=[0.6, 0.2, 0.95, 0.8]
-- Object in center: bbox=[0.3, 0.3, 0.7, 0.7]
-- Small object: bbox=[0.4, 0.4, 0.6, 0.6]
+BBOX EXAMPLES:
+- Left object: [0.05, 0.2, 0.4, 0.8]
+- Right object: [0.6, 0.2, 0.95, 0.8]  
+- Center object: [0.25, 0.25, 0.75, 0.75]
+- Top-left small: [0.05, 0.05, 0.3, 0.35]
 
-DESCRIPTION: Use simple terms for Grounding DINO:
-- "phone" "wallet" "key" "pen" "bottle"
-- "motor" "terminal" "screw" "cable" "button"
-- "warning sign" "label" "text"
+For CUSTOM objects (motors, terminals, screws, text/signs, labels):
+- Provide ACCURATE bounding boxes since detection models may not recognize them
+- Be very precise with bbox coordinates
 
-For CUSTOM/INDUSTRIAL objects (motors, terminals, signs), provide ACCURATE bbox coordinates since DINO may not recognize them.
-
-Return JSON only, no explanation."""
+Return JSON only."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -115,26 +112,32 @@ Return JSON only, no explanation."""
     
     def extract(self, frame: np.ndarray, text: str, frame_size: Tuple[int, int]) -> List[GeminiDetection]:
         """
-        Extract ONLY the specific object(s) the user asked about.
+        Extract ALL objects mentioned by the user with accurate bboxes.
         """
         self._ensure_client()
         if self.client is None:
+            print("[GeminiExtractor] No client - using fallback")
             return self._fallback(text, frame_size)
         
         try:
             # Convert frame to JPEG
             pil_img = Image.fromarray(frame)
             buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=70)
+            pil_img.save(buf, format="JPEG", quality=75)
             img_b64 = base64.b64encode(buf.getvalue()).decode()
             
             prompt = f"""{self.SYSTEM_PROMPT}
 
-User's question: "{text}"
+User's request: "{text}"
 
-Identify ONLY the specific object the user is asking about. Return just that one object with its bbox.
-If user asks "what is this" or "what is in my hand" - identify the main object being shown/held.
-Do NOT list background objects or multiple items unless specifically asked."""
+Instructions:
+- Find ALL objects mentioned in the user's request
+- If user says "highlight X and Y" - include BOTH X and Y
+- If user asks "what is this" - identify the main object being shown
+- Provide accurate bounding boxes for each object
+- For custom/industrial/text objects, be extra precise with bbox
+
+Return JSON with ALL requested objects."""
             
             response = self.client.models.generate_content(
                 model="gemini-2.0-flash",
@@ -145,20 +148,37 @@ Do NOT list background objects or multiple items unless specifically asked."""
             )
             
             result = response.text.strip()
-            print(f"[GeminiExtractor] Response: {result[:300]}")
+            print(f"[GeminiExtractor] Raw response: {result[:400]}")
             
             # Parse JSON response
             detections = self._parse_response(result)
             
-            # If no bboxes were parsed, assign default center bbox
+            # Validate and fix bboxes
+            valid_detections = []
             for d in detections:
                 if d.bbox is None:
                     d.bbox = (0.2, 0.2, 0.8, 0.8)  # Default center region
-                    print(f"[GeminiExtractor] '{d.description}' - assigned default bbox")
+                    print(f"[GeminiExtractor] '{d.description}' - no bbox, using default")
                 else:
-                    print(f"[GeminiExtractor] '{d.description}' at {d.bbox}")
+                    # Validate bbox values are in 0-1 range
+                    x1, y1, x2, y2 = d.bbox
+                    x1 = max(0.0, min(1.0, x1))
+                    y1 = max(0.0, min(1.0, y1))
+                    x2 = max(0.0, min(1.0, x2))
+                    y2 = max(0.0, min(1.0, y2))
+                    if x2 > x1 and y2 > y1:
+                        d.bbox = (x1, y1, x2, y2)
+                        print(f"[GeminiExtractor] '{d.description}' at bbox={d.bbox}")
+                    else:
+                        d.bbox = (0.2, 0.2, 0.8, 0.8)
+                        print(f"[GeminiExtractor] '{d.description}' - invalid bbox, using default")
+                valid_detections.append(d)
             
-            return detections if detections else self._fallback(text, frame_size)
+            if valid_detections:
+                print(f"[GeminiExtractor] Found {len(valid_detections)} object(s)")
+                return valid_detections
+            else:
+                return self._fallback(text, frame_size)
             
         except Exception as e:
             print(f"[GeminiExtractor] Error: {e}")
@@ -382,7 +402,12 @@ class HybridSAMTracker:
         self.sam_processor = None
         
         # Gemini extractor
-        self.gemini_extractor = PreciseGeminiExtractor(api_key) if api_key else None
+        if api_key:
+            print(f"[Tracker] Creating Gemini extractor with API key ({len(api_key)} chars)")
+            self.gemini_extractor = PreciseGeminiExtractor(api_key)
+        else:
+            print("[Tracker] WARNING: No API key provided - Gemini extractor disabled!")
+            self.gemini_extractor = None
         
         # State
         self.current_prompt = ""
@@ -537,9 +562,11 @@ class HybridSAMTracker:
         while self._running:
             try:
                 frame, text = self.extraction_queue.get(timeout=0.5)
+                print(f"[Tracker] Processing extraction request...")
                 
                 if self.gemini_extractor:
                     h, w = frame.shape[:2]
+                    print(f"[Tracker] Calling Gemini extractor with frame {w}x{h}...")
                     detections = self.gemini_extractor.extract(frame, text, (w, h))
                     
                     if detections:
@@ -550,11 +577,15 @@ class HybridSAMTracker:
                         # No detections - keep previous prompt (don't clear immediately)
                         # Only log, don't clear
                         print("[Tracker] No new objects detected")
+                else:
+                    print("[Tracker] ERROR: Gemini extractor not initialized (no API key?)")
             
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"[Tracker] Extraction error: {e}")
+                import traceback
+                traceback.print_exc()
     
     def start(self):
         self._running = True
