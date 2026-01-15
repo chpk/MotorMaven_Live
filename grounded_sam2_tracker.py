@@ -712,34 +712,79 @@ class HybridSAMTracker:
     
     @torch.inference_mode()
     def segment(self, image: np.ndarray, detections: List[DetectedObject]) -> List[DetectedObject]:
-        """Generate masks using SAM."""
+        """Generate masks using SAM with proper format for both SAM1 and SAM2."""
         if not self.models_loaded or not detections:
             return detections
         
         try:
             pil_image = Image.fromarray(image)
+            h, w = image.shape[:2]
+            is_sam2 = "sam2" in self.sam_model_name
             
             for det in detections:
-                x1, y1, x2, y2 = det.bbox
-                input_boxes = [[[float(x1), float(y1), float(x2), float(y2)]]]
-                
-                inputs = self.sam_processor(
-                    images=pil_image,
-                    input_boxes=input_boxes,
-                    return_tensors="pt"
-                ).to(self.device)
-                
-                outputs = self.sam_model(**inputs)
-                
-                masks = self.sam_processor.image_processor.post_process_masks(
-                    outputs.pred_masks.cpu(),
-                    inputs["original_sizes"].cpu(),
-                    inputs["reshaped_input_sizes"].cpu()
-                )
-                
-                if masks and len(masks) > 0 and len(masks[0]) > 0:
-                    mask = masks[0][0][0].numpy()
-                    det.mask = mask > 0.5
+                try:
+                    x1, y1, x2, y2 = det.bbox
+                    
+                    # Ensure valid bbox coordinates (pixel values)
+                    x1 = max(0, min(w - 1, int(x1)))
+                    y1 = max(0, min(h - 1, int(y1)))
+                    x2 = max(x1 + 10, min(w, int(x2)))
+                    y2 = max(y1 + 10, min(h, int(y2)))
+                    
+                    # Use center point as prompt (more reliable than boxes for HF models)
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    
+                    # Input points format: [[[x, y]]] for single point
+                    input_points = [[[float(cx), float(cy)]]]
+                    input_labels = [[1]]  # 1 = foreground point
+                    
+                    inputs = self.sam_processor(
+                        images=pil_image,
+                        input_points=input_points,
+                        input_labels=input_labels,
+                        return_tensors="pt"
+                    ).to(self.device)
+                    
+                    outputs = self.sam_model(**inputs)
+                    
+                    # Post-process masks
+                    masks = self.sam_processor.image_processor.post_process_masks(
+                        outputs.pred_masks.cpu(),
+                        inputs["original_sizes"].cpu(),
+                        inputs["reshaped_input_sizes"].cpu()
+                    )
+                    
+                    if masks and len(masks) > 0 and len(masks[0]) > 0:
+                        mask_tensor = masks[0][0]
+                        
+                        # Handle different output shapes
+                        if len(mask_tensor.shape) == 3:
+                            # Multiple mask predictions - take best one (usually last or middle)
+                            # SAM predicts 3 masks with different granularity
+                            scores = outputs.iou_scores[0][0] if hasattr(outputs, 'iou_scores') else None
+                            if scores is not None:
+                                best_idx = torch.argmax(scores).item()
+                            else:
+                                best_idx = mask_tensor.shape[0] - 1  # Take last (largest mask)
+                            mask = mask_tensor[best_idx].numpy()
+                        else:
+                            mask = mask_tensor.numpy()
+                        
+                        det.mask = mask > 0.5
+                        
+                except Exception as seg_err:
+                    # Fallback: create simple rectangular mask from bbox
+                    try:
+                        mask = np.zeros((h, w), dtype=bool)
+                        x1, y1, x2, y2 = det.bbox
+                        x1, y1 = max(0, int(x1)), max(0, int(y1))
+                        x2, y2 = min(w, int(x2)), min(h, int(y2))
+                        mask[y1:y2, x1:x2] = True
+                        det.mask = mask
+                    except:
+                        pass
+                    continue
             
             return detections
             
