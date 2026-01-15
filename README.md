@@ -24,7 +24,7 @@ User Speech --> Gemini Live API --> Extract Object Descriptions
            +----------+----------+
            |                     |
            v                     v
-      SAM3 Image            DINO + SAM2
+      SAM3 Video            DINO + SAM2
     (Text Prompts)       (Visual Prompts)
            |                     |
            +----------+----------+
