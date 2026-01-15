@@ -1,0 +1,71 @@
+# ============================================
+# Gemini Live + Grounded SAM2 - All Dependencies
+# ============================================
+#
+# INSTALLATION ORDER:
+# 1. Install system dependencies (portaudio)
+# 2. Install PyTorch with CUDA
+# 3. Install this file: pip install -r requirements.txt
+#
+# See README.md for full instructions
+
+# ============================================
+# CORE - Gemini Live API
+# ============================================
+google-genai>=1.0.0
+
+# ============================================
+# AUDIO
+# ============================================
+# Requires system library: sudo apt-get install -y portaudio19-dev
+pyaudio>=0.2.14
+
+# ============================================
+# VIDEO / IMAGE
+# ============================================
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ============================================
+# WEB UI
+# ============================================
+gradio>=4.0.0
+
+# ============================================
+# GROUNDED SAM2 (via HuggingFace - NO repo clone needed!)
+# ============================================
+# Grounding DINO + SAM2 are available as HuggingFace models
+# They download automatically on first run
+
+# HuggingFace Transformers (includes Grounding DINO + SAM2)
+transformers>=4.40.0
+
+# Model loading acceleration
+accelerate>=0.27.0
+
+# Vision model dependencies
+timm>=0.9.0
+
+# Scientific computing for SAM2
+scipy>=1.11.0
+
+# Visualization (optional but recommended)
+supervision>=0.21.0
+
+# ============================================
+# UTILITIES
+# ============================================
+python-dotenv>=1.0.0
+
+# ============================================
+# NOTE: PyTorch must be installed separately!
+# ============================================
+# For CUDA 12.1:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# For CUDA 11.8:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# For CPU only:
+#   pip install torch torchvision torchaudio
